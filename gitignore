@@ -1,0 +1,6 @@
+lw.env
+feeds/
+lw_cache.json
+data/
+__pycache__/
+*.pyc
