@@ -7,7 +7,9 @@ supervisor —— 在容器里同时做两件事：
 只用标准库，不依赖系统 cron，避免 Alpine 装 cron 包和时区配置的额外坑。
 """
 
+import base64
 import http.server
+import hmac
 import os
 import socketserver
 import subprocess
@@ -36,9 +38,30 @@ def now():
     return datetime.now(TZ) if TZ else datetime.now()
 
 
+AUTH_USER = os.environ.get("LW_HTTP_USER", "")
+AUTH_PASS = os.environ.get("LW_HTTP_PASS", "")
+
+
+def check_auth(header_value):
+    """校验 Authorization: Basic xxx，使用 compare_digest 防时序攻击"""
+    if not header_value or not header_value.startswith("Basic "):
+        return False
+    try:
+        raw = base64.b64decode(header_value[6:]).decode("utf-8")
+        user, _, pw = raw.partition(":")
+    except Exception:  # noqa: BLE001
+        return False
+    return hmac.compare_digest(user, AUTH_USER) and hmac.compare_digest(pw, AUTH_PASS)
+
+
 def serve():
-    """在 FEEDS_DIR 上起一个只读静态文件服务"""
+    """在 FEEDS_DIR 上起一个只读静态文件服务，可选 HTTP Basic Auth"""
     os.makedirs(FEEDS_DIR, exist_ok=True)
+    auth_enabled = bool(AUTH_USER and AUTH_PASS)
+    if auth_enabled:
+        print("HTTP Basic Auth 已启用", flush=True)
+    else:
+        print("[!] 未设置 LW_HTTP_USER/LW_HTTP_PASS，域名当前公开无密码", flush=True)
 
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *a, **kw):
@@ -46,6 +69,14 @@ def serve():
 
         def log_message(self, fmt, *args):
             print(f"[http] {self.address_string()} {fmt % args}", flush=True)
+
+        def do_GET(self):
+            if auth_enabled and not check_auth(self.headers.get("Authorization")):
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="lingowhale-feeds"')
+                self.end_headers()
+                return
+            super().do_GET()
 
     with socketserver.ThreadingTCPServer(("0.0.0.0", PORT), Handler) as httpd:
         print(f"HTTP 服务已启动: 0.0.0.0:{PORT} -> {FEEDS_DIR}", flush=True)
