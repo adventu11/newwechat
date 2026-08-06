@@ -324,7 +324,12 @@ def main():
     ap.add_argument("--max-items", type=int, default=50, help="每个 feed 最多条数")
     ap.add_argument("--limit", type=int, default=20, help="每页条数")
     ap.add_argument("--delay", type=float, default=1.0, help="请求间隔秒")
-    ap.add_argument("--no-content", action="store_true", help="不取正文，只要链接")
+    ap.add_argument("--no-content", action="store_true", help="不取详情(无链接/无正文)")
+    ap.add_argument(
+        "--link-only",
+        action="store_true",
+        help="取详情但不把全文塞进RSS，只保留标题/摘要/原文链接",
+    )
     ap.add_argument("--cache", default="./lw_cache.json", help="详情缓存文件")
     ap.add_argument("--list-channels", action="store_true", help="打印所有 channel_id")
     args = ap.parse_args()
@@ -378,6 +383,10 @@ def main():
                     print(f"  详情失败 {eid}: {e}", file=sys.stderr)
 
             entries.append(row)
+
+        if args.link_only:
+            for row in entries:
+                row["html"] = ""
 
         self_url = f"{args.base_url.rstrip('/')}/{name}.atom" if args.base_url else ""
         xml = build_atom(f"语鲸 - {name}", self_url, entries)

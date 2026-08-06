@@ -112,6 +112,8 @@ def run_job():
         cmd += ["--base-url", base_url]
     if os.environ.get("LW_NO_CONTENT") == "1":
         cmd.append("--no-content")
+    elif os.environ.get("LW_LINK_ONLY") == "1":
+        cmd.append("--link-only")
 
     try:
         subprocess.run(cmd, check=True)
