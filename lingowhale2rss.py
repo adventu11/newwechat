@@ -18,6 +18,7 @@ lingowhale2rss —— 把语鲸订阅的公众号转成 Atom 订阅源
 
 import argparse
 import base64
+import gc
 import gzip
 import json
 import os
@@ -316,39 +317,38 @@ def list_channels(headers):
             print(f'  {c["channel_id"]}  {c["name"]}  (未分组)')
 
 
-# ---------------------------------------------------------------- 主流程
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="./feeds", help="输出目录")
-    ap.add_argument("--base-url", default="", help="feed 的公开访问前缀")
-    ap.add_argument("--max-items", type=int, default=50, help="每个 feed 最多条数")
-    ap.add_argument("--limit", type=int, default=20, help="每页条数")
-    ap.add_argument("--delay", type=float, default=1.0, help="请求间隔秒")
-    ap.add_argument("--no-content", action="store_true", help="不取详情(无链接/无正文)")
-    ap.add_argument(
-        "--link-only",
-        action="store_true",
-        help="取详情但不把全文塞进RSS，只保留标题/摘要/原文链接",
-    )
-    ap.add_argument("--cache", default="./lw_cache.json", help="详情缓存文件")
-    ap.add_argument("--list-channels", action="store_true", help="打印所有 channel_id")
-    args = ap.parse_args()
-
-    load_env_file()
+# ---------------------------------------------------------------- 核心流程
+# 抽成独立函数，方便 supervisor.py 直接 import 调用，避免另起一个 Python
+# 进程(subprocess)——两个解释器同时常驻在内存紧张的环境里会直接顶爆限额。
+def run(
+    out="./feeds",
+    base_url="",
+    max_items=50,
+    limit=10,
+    delay=1.0,
+    no_content=False,
+    link_only=False,
+    cache_path="./lw_cache.json",
+    cache_max_age_days=14,
+):
     headers = build_headers()
     check_token_expiry()
 
-    if args.list_channels:
-        list_channels(headers)
-        return
+    os.makedirs(out, exist_ok=True)
+    cache = load_cache(cache_path)
 
-    os.makedirs(args.out, exist_ok=True)
-    cache = load_cache(args.cache)
+    # link_only/no_content 模式下不需要正文，把已缓存条目里的 html 直接清空。
+    # 这一行是"自愈"：哪怕磁盘上的缓存文件是之前全文模式攒下的大文件，
+    # 本次运行加载进内存后立刻瘦身，且下面 save_cache() 会把瘦身结果写回磁盘。
+    if link_only or no_content:
+        for v in cache.values():
+            v["html"] = ""
+
     new_details = 0
 
     for name, channel_ids in GROUPS.items():
         print(f"[{name}] 拉取中…", file=sys.stderr)
-        raw = fetch_feed(headers, channel_ids, args.max_items, args.limit, args.delay)
+        raw = fetch_feed(headers, channel_ids, max_items, limit, delay)
         entries = []
 
         for it in raw:
@@ -367,36 +367,102 @@ def main():
 
             if eid in cache:
                 row.update(cache[eid])
-            elif not args.no_content:
+                # 老条目可能是升级前缓存的，没有 pub_time，借这次机会补上，
+                # 否则永远进不了下面的按时间清理逻辑，缓存会一直有增无减
+                cache[eid].setdefault("pub_time", it.get("pub_time"))
+            elif not no_content:
                 try:
                     res = fetch_detail(headers, eid, it["entry_type"])
                     d = {
                         "orig_url": res.get("orig_url", ""),
                         "author": (res.get("author") or {}).get("name", ""),
-                        "html": res.get("html", ""),
+                        # link_only 模式下不需要正文，压根不存，
+                        # 而不是存了再在输出阶段丢弃——减少的是缓存本身的体积
+                        "html": "" if link_only else res.get("html", ""),
+                        "pub_time": it.get("pub_time"),
                     }
                     cache[eid] = d
                     row.update(d)
                     new_details += 1
-                    time.sleep(args.delay)
+                    time.sleep(delay)
                 except Exception as e:  # noqa: BLE001
                     print(f"  详情失败 {eid}: {e}", file=sys.stderr)
 
             entries.append(row)
 
-        if args.link_only:
-            for row in entries:
-                row["html"] = ""
-
-        self_url = f"{args.base_url.rstrip('/')}/{name}.atom" if args.base_url else ""
+        self_url = f"{base_url.rstrip('/')}/{name}.atom" if base_url else ""
         xml = build_atom(f"语鲸 - {name}", self_url, entries)
-        path = os.path.join(args.out, f"{name}.atom")
+        path = os.path.join(out, f"{name}.atom")
         with open(path, "w", encoding="utf-8") as f:
             f.write(xml)
         print(f"[{name}] {len(entries)} 篇 -> {path}", file=sys.stderr)
 
-    save_cache(args.cache, cache)
+        # 组间显式回收：raw/entries 本轮已写盘，尽快归还内存池，
+        # 而不是等垃圾回收器自己判断时机——在紧张的内存限额下这点很重要
+        del raw, entries
+        gc.collect()
+
+    # 按发布时间清理过期缓存条目，防止 lw_cache.json 无限增长。
+    # 这是这次 OOM 的根本原因：缓存从不清理，天数越多、常驻内存越高。
+    if cache_max_age_days > 0:
+        cutoff = time.time() - cache_max_age_days * 86400
+        before = len(cache)
+        cache = {
+            k: v for k, v in cache.items() if (v.get("pub_time") or cutoff) >= cutoff
+        }
+        removed = before - len(cache)
+        if removed:
+            print(f"清理过期缓存 {removed} 条(保留最近 {cache_max_age_days} 天)", file=sys.stderr)
+
+    save_cache(cache_path, cache)
     print(f"完成，新增详情 {new_details} 条，缓存共 {len(cache)} 条", file=sys.stderr)
+
+
+def run_from_args(args):
+    if args.list_channels:
+        headers = build_headers()
+        check_token_expiry()
+        list_channels(headers)
+        return
+    run(
+        out=args.out,
+        base_url=args.base_url,
+        max_items=args.max_items,
+        limit=args.limit,
+        delay=args.delay,
+        no_content=args.no_content,
+        link_only=args.link_only,
+        cache_path=args.cache,
+        cache_max_age_days=args.cache_max_age_days,
+    )
+
+
+# ---------------------------------------------------------------- 命令行入口
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default="./feeds", help="输出目录")
+    ap.add_argument("--base-url", default="", help="feed 的公开访问前缀")
+    ap.add_argument("--max-items", type=int, default=50, help="每个 feed 最多条数")
+    ap.add_argument("--limit", type=int, default=10, help="每页条数")
+    ap.add_argument("--delay", type=float, default=1.0, help="请求间隔秒")
+    ap.add_argument("--no-content", action="store_true", help="不取详情(无链接/无正文)")
+    ap.add_argument(
+        "--link-only",
+        action="store_true",
+        help="取详情但不把全文塞进RSS，只保留标题/摘要/原文链接",
+    )
+    ap.add_argument("--cache", default="./lw_cache.json", help="详情缓存文件")
+    ap.add_argument(
+        "--cache-max-age-days",
+        type=int,
+        default=14,
+        help="缓存条目保留天数，超过则清理(0=不清理，不建议)",
+    )
+    ap.add_argument("--list-channels", action="store_true", help="打印所有 channel_id")
+    args = ap.parse_args()
+
+    load_env_file()
+    run_from_args(args)
 
 
 if __name__ == "__main__":

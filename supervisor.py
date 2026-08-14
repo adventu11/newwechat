@@ -8,15 +8,16 @@ supervisor —— 在容器里同时做两件事：
 """
 
 import base64
+import gc
 import http.server
 import hmac
 import os
 import socketserver
-import subprocess
-import sys
 import threading
 import time
 from datetime import datetime, timedelta
+
+import lingowhale2rss as lw2r
 
 try:
     from zoneinfo import ZoneInfo
@@ -31,7 +32,6 @@ DATA_DIR = os.environ.get("LW_DATA_DIR", "/app/data")
 FEEDS_DIR = os.path.join(DATA_DIR, "feeds")
 CACHE_PATH = os.path.join(DATA_DIR, "lw_cache.json")
 PORT = int(os.environ.get("PORT", 8080))
-SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lingowhale2rss.py")
 
 
 def now():
@@ -71,6 +71,14 @@ def serve():
             print(f"[http] {self.address_string()} {fmt % args}", flush=True)
 
         def do_GET(self):
+            if self.path == "/healthz":
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if auth_enabled and not check_auth(self.headers.get("Authorization")):
                 self.send_response(401)
                 self.send_header("WWW-Authenticate", 'Basic realm="lingowhale-feeds"')
@@ -95,33 +103,26 @@ def next_run(t):
 
 def run_job():
     print(f"[{now()}] 开始抓取", flush=True)
-    cmd = [
-        sys.executable,
-        SCRIPT,
-        "--out",
-        FEEDS_DIR,
-        "--cache",
-        CACHE_PATH,
-        "--max-items",
-        os.environ.get("LW_MAX_ITEMS", "30"),
-        "--delay",
-        os.environ.get("LW_DELAY", "1.0"),
-    ]
-    base_url = os.environ.get("LW_BASE_URL", "")
-    if base_url:
-        cmd += ["--base-url", base_url]
-    if os.environ.get("LW_NO_CONTENT") == "1":
-        cmd.append("--no-content")
-    elif os.environ.get("LW_LINK_ONLY") == "1":
-        cmd.append("--link-only")
-
     try:
-        subprocess.run(cmd, check=True)
+        lw2r.run(
+            out=FEEDS_DIR,
+            base_url=os.environ.get("LW_BASE_URL", ""),
+            max_items=int(os.environ.get("LW_MAX_ITEMS", "30")),
+            limit=int(os.environ.get("LW_LIMIT", "10")),
+            delay=float(os.environ.get("LW_DELAY", "1.0")),
+            no_content=os.environ.get("LW_NO_CONTENT") == "1",
+            link_only=os.environ.get("LW_LINK_ONLY") == "1",
+            cache_path=CACHE_PATH,
+            cache_max_age_days=int(os.environ.get("LW_CACHE_MAX_AGE_DAYS", "14")),
+        )
         print(f"[{now()}] 抓取完成", flush=True)
-    except subprocess.CalledProcessError as e:
-        print(f"[{now()}] 抓取失败: {e}", flush=True)
+    except SystemExit as e:
+        # build_headers()/check_token_expiry() 配置有误时用 sys.exit() 报错。
+        # 现在跟 supervisor 同一个进程，必须拦下来，否则会连 HTTP 服务一起被杀掉。
+        print(f"[{now()}] 抓取因配置问题中止: {e}", flush=True)
     except Exception as e:  # noqa: BLE001
         print(f"[{now()}] 抓取异常: {e}", flush=True)
+    gc.collect()
 
 
 def scheduler():
