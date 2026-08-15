@@ -374,7 +374,11 @@ def run(
                 try:
                     res = fetch_detail(headers, eid, it["entry_type"])
                     d = {
-                        "orig_url": res.get("orig_url", ""),
+                        # 语鲸返回的是 http，换成 https 只是去掉一个明显的
+                        # "机器访问"信号，不能根治环境异常校验，但没有副作用
+                        "orig_url": res.get("orig_url", "").replace(
+                            "http://mp.weixin.qq.com", "https://mp.weixin.qq.com", 1
+                        ),
                         "author": (res.get("author") or {}).get("name", ""),
                         # link_only 模式下不需要正文，压根不存，
                         # 而不是存了再在输出阶段丢弃——减少的是缓存本身的体积
