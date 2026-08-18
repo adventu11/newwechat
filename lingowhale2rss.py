@@ -25,6 +25,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from xml.sax.saxutils import escape
@@ -185,27 +186,92 @@ def post(url, headers, payload=None, retries=3):
     raise RuntimeError(f"请求失败 {url}: {last}")
 
 
-# ---------------------------------------------------------------- 令牌检查
-def check_token_expiry():
-    tok = os.environ.get("LW_ACCESS_TOKEN", "")
-    parts = tok.split(".")
-    if len(parts) != 3:
-        return
+# ---------------------------------------------------------------- 微信推送(Server酱)
+def send_wechat_notify(title, content):
+    """通过 Server酱 把消息推到微信。没配 SENDKEY 就跳过，不影响主流程。"""
+    sendkey = os.environ.get("SERVERCHAN_SENDKEY", "")
+    if not sendkey:
+        print("[!] 未设置 SERVERCHAN_SENDKEY，跳过微信推送", file=sys.stderr)
+        return False
+    url = f"https://sctapi.ftqq.com/{sendkey}.send"
+    data = urllib.parse.urlencode({"title": title, "desp": content}).encode("utf-8")
     try:
-        p = parts[1] + "=" * (-len(parts[1]) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(p))
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=15) as r:
+            resp = json.loads(r.read().decode("utf-8"))
+        ok = resp.get("code") == 0
+        if not ok:
+            print(f"[!] 微信推送失败: {resp}", file=sys.stderr)
+        return ok
+    except Exception as e:  # noqa: BLE001
+        print(f"[!] 微信推送异常: {e}", file=sys.stderr)
+        return False
+
+
+def load_notify_state(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
     except Exception:  # noqa: BLE001
-        return
-    exp = claims.get("exp")
-    if not exp:
-        return
-    days = (exp - time.time()) / 86400
-    if days < 0:
-        sys.exit("Access-Token 已过期，请重新登录语鲸后抓取新令牌")
-    if days < 3:
-        print(f"[!] Access-Token 仅剩 {days:.1f} 天，请尽快更新", file=sys.stderr)
-    else:
-        print(f"令牌剩余 {days:.1f} 天", file=sys.stderr)
+        return {}
+
+
+def save_notify_state(path, state):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------- 令牌检查
+def check_token_expiry(notify_state_path=None, notify_days=1):
+    """
+    检查 LW_ACCESS_TOKEN / LW_AUTH_TOKEN 的剩余有效期。
+    剩余天数跌破 notify_days 时推一条微信消息；用 notify_state_path 记录
+    "这个 exp 值是否已经通知过"，避免一天跑 3 次调度就收到 3 条重复消息——
+    只有换了新令牌(exp 变化)才会重新触发提醒。
+    """
+    state = load_notify_state(notify_state_path) if notify_state_path else {}
+    state_changed = False
+
+    for env_key, label in (
+        ("LW_ACCESS_TOKEN", "Access-Token"),
+        ("LW_AUTH_TOKEN", "Auth-Token"),
+    ):
+        tok = os.environ.get(env_key, "")
+        parts = tok.split(".")
+        if len(parts) != 3:
+            continue
+        try:
+            p = parts[1] + "=" * (-len(parts[1]) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(p))
+        except Exception:  # noqa: BLE001
+            continue
+        exp = claims.get("exp")
+        if not exp:
+            continue
+
+        days = (exp - time.time()) / 86400
+        if days < 0:
+            sys.exit(f"{label} 已过期，请重新登录语鲸后抓取新令牌")
+        if days < 3:
+            print(f"[!] {label} 仅剩 {days:.1f} 天，请尽快更新", file=sys.stderr)
+        else:
+            print(f"{label} 剩余 {days:.1f} 天", file=sys.stderr)
+
+        if days <= notify_days and notify_state_path:
+            if state.get(env_key) != exp:  # 这个 exp 还没通知过，或者是新换的令牌
+                ok = send_wechat_notify(
+                    f"语鲸 {label} 即将过期",
+                    f"{label} 还剩 {days:.1f} 天过期，"
+                    f"请尽快登录语鲸抓取新令牌，并更新到部署的环境变量里。",
+                )
+                if ok:
+                    state[env_key] = exp
+                    state_changed = True
+
+    if state_changed and notify_state_path:
+        save_notify_state(notify_state_path, state)
 
 
 # ---------------------------------------------------------------- 拉取
@@ -330,9 +396,13 @@ def run(
     link_only=False,
     cache_path="./lw_cache.json",
     cache_max_age_days=14,
+    notify_days=1,
 ):
     headers = build_headers()
-    check_token_expiry()
+    notify_state_path = os.path.join(
+        os.path.dirname(os.path.abspath(cache_path)), "lw_notify_state.json"
+    )
+    check_token_expiry(notify_state_path=notify_state_path, notify_days=notify_days)
 
     os.makedirs(out, exist_ok=True)
     cache = load_cache(cache_path)
@@ -438,6 +508,7 @@ def run_from_args(args):
         link_only=args.link_only,
         cache_path=args.cache,
         cache_max_age_days=args.cache_max_age_days,
+        notify_days=args.notify_days,
     )
 
 
@@ -461,6 +532,12 @@ def main():
         type=int,
         default=14,
         help="缓存条目保留天数，超过则清理(0=不清理，不建议)",
+    )
+    ap.add_argument(
+        "--notify-days",
+        type=int,
+        default=1,
+        help="令牌剩余天数低于此值时通过 Server酱 推送微信提醒",
     )
     ap.add_argument("--list-channels", action="store_true", help="打印所有 channel_id")
     args = ap.parse_args()

@@ -114,6 +114,7 @@ def run_job():
             link_only=os.environ.get("LW_LINK_ONLY") == "1",
             cache_path=CACHE_PATH,
             cache_max_age_days=int(os.environ.get("LW_CACHE_MAX_AGE_DAYS", "14")),
+            notify_days=int(os.environ.get("LW_NOTIFY_DAYS", "1")),
         )
         print(f"[{now()}] 抓取完成", flush=True)
     except SystemExit as e:
