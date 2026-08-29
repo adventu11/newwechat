@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 lingowhale2rss —— 把语鲸订阅的公众号转成 Atom 订阅源
-
 只用标准库，无需 pip install。
 
 用法:
@@ -14,6 +13,19 @@ lingowhale2rss —— 把语鲸订阅的公众号转成 Atom 订阅源
     python lingowhale2rss.py --out ./feeds
 
 生成的 .atom 文件放到任意静态服务器下，Miniflux 订阅即可。
+
+--------------------------------------------------------------------------
+本版针对"部分文章漏抓"做了四处结构性修改:
+
+1. 逐个 channel 拉取，而不是把整组 channel_ids 混在一起拉前 N 条。
+   旧写法下 yiyao 组 32 个号共享 30 条配额，日更号会把低频号挤出窗口。
+2. Atom 从缓存出，而不是只写"本次抓到的"。缓存保留 14 天，因此单次抓取
+   失败、或两次运行之间的时间窗口过长，都不会再造成文章永久丢失。
+3. 详情抓取失败的条目不再写进 feed（旧版会输出一条没有 <link> 的条目，
+   Miniflux 落库后即使下次成功也未必回填链接），改为跳过、下次重试。
+4. entry_type 过滤可配置，并统计被过滤掉的类型，方便确认多图文次条、
+   专题聚合等是不是被误杀。
+--------------------------------------------------------------------------
 """
 
 import argparse
@@ -37,6 +49,11 @@ SUBS_EP = API + "user_subscribe/list"
 
 # 语鲸通用排序参数。注意: 缺失时接口不会报错，而是静默返回默认订阅，务必带上。
 SORT_TYPE = 2
+
+# 允许进入 feed 的 entry_type。7 = 文章。
+# 如果发现某些推送始终不出现，先看运行日志末尾的"entry_type 分布"，
+# 把需要的类型号加进来即可（用 --entry-types 7,8 覆盖，无需改代码）。
+DEFAULT_ENTRY_TYPES = {7}
 
 # ---------------------------------------------------------------- 分组配置
 # key = 输出的 feed 文件名(建议英文), value = channel_id 列表
@@ -113,8 +130,9 @@ GROUPS = {
     ],
 }
 
-
 # ---------------------------------------------------------------- 环境变量
+
+
 def load_env_file(path="lw.env"):
     if not os.path.exists(path):
         return
@@ -162,6 +180,8 @@ def build_headers():
 
 
 # ---------------------------------------------------------------- HTTP
+
+
 def post(url, headers, payload=None, retries=3):
     body = json.dumps(payload or {}).encode("utf-8")
     last = None
@@ -170,12 +190,12 @@ def post(url, headers, payload=None, retries=3):
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 raw = r.read()
-                if r.headers.get("Content-Encoding") == "gzip":
-                    raw = gzip.decompress(raw)
-                j = json.loads(raw.decode("utf-8"))
-                if j.get("code") != 0:
-                    raise RuntimeError(f"API code={j.get('code')} msg={j.get('msg')}")
-                return j.get("data") or {}
+            if r.headers.get("Content-Encoding") == "gzip":
+                raw = gzip.decompress(raw)
+            j = json.loads(raw.decode("utf-8"))
+            if j.get("code") != 0:
+                raise RuntimeError(f"API code={j.get('code')} msg={j.get('msg')}")
+            return j.get("data") or {}
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 sys.exit(f"鉴权失败 ({e.code})，令牌可能已过期，请重新抓取")
@@ -187,6 +207,8 @@ def post(url, headers, payload=None, retries=3):
 
 
 # ---------------------------------------------------------------- 微信推送(Server酱)
+
+
 def send_wechat_notify(title, content):
     """通过 Server酱 把消息推到微信。没配 SENDKEY 就跳过，不影响主流程。"""
     sendkey = os.environ.get("SERVERCHAN_SENDKEY", "")
@@ -224,9 +246,12 @@ def save_notify_state(path, state):
 
 
 # ---------------------------------------------------------------- 令牌检查
+
+
 def check_token_expiry(notify_state_path=None, notify_days=1):
     """
     检查 LW_ACCESS_TOKEN / LW_AUTH_TOKEN 的剩余有效期。
+
     剩余天数跌破 notify_days 时推一条微信消息；用 notify_state_path 记录
     "这个 exp 值是否已经通知过"，避免一天跑 3 次调度就收到 3 条重复消息——
     只有换了新令牌(exp 变化)才会重新触发提醒。
@@ -250,7 +275,6 @@ def check_token_expiry(notify_state_path=None, notify_days=1):
         exp = claims.get("exp")
         if not exp:
             continue
-
         days = (exp - time.time()) / 86400
         if days < 0:
             sys.exit(f"{label} 已过期，请重新登录语鲸后抓取新令牌")
@@ -275,8 +299,18 @@ def check_token_expiry(notify_state_path=None, notify_days=1):
 
 
 # ---------------------------------------------------------------- 拉取
-def fetch_feed(headers, channel_ids, max_items, limit, delay):
-    """按 cursor 翻页拉文章列表"""
+
+
+def fetch_channel_feed(headers, channel_id, max_items, limit, delay, cutoff=0):
+    """
+    按 cursor 翻页拉【单个公众号】的文章列表。
+
+    单号拉取是这版的核心改动：旧版把整组 channel_ids 一起丢给接口再取前 N 条，
+    等于让同组所有号抢一个配额，日更号必然把低频号挤掉。
+
+    cutoff: unix 时间戳。翻到比它更老的文章就停——反正缓存也只保留这么久，
+    再往前翻纯属浪费请求额度。
+    """
     items, cursor = [], ""
     while len(items) < max_items:
         data = post(
@@ -287,13 +321,17 @@ def fetch_feed(headers, channel_ids, max_items, limit, delay):
                 "sort_type": SORT_TYPE,
                 "limit": limit,
                 "filter_unread": False,
-                "channel_ids": channel_ids,
+                "channel_ids": [channel_id],
             },
         )
         batch = data.get("feed_list") or []
         if not batch:
             break
         items.extend(batch)
+
+        oldest = min((b.get("pub_time") or 0) for b in batch)
+        if cutoff and oldest and oldest < cutoff:
+            break
         if not data.get("has_more"):
             break
         cursor = data.get("cursor") or ""
@@ -327,6 +365,8 @@ def save_cache(path, cache):
 
 
 # ---------------------------------------------------------------- Atom
+
+
 def rfc3339(ts):
     if not ts:
         ts = time.time()
@@ -368,6 +408,8 @@ def build_atom(title, self_url, entries):
 
 
 # ---------------------------------------------------------------- 频道清单
+
+
 def list_channels(headers):
     data = post(SUBS_EP, headers, {"sort_type": SORT_TYPE})
     for s in data.get("user_subscribes") or []:
@@ -376,20 +418,23 @@ def list_channels(headers):
             print(f'\n# 分组: {g["name"]}')
             ids = [c["channel_id"] for c in (g.get("channels") or [])]
             for c in g.get("channels") or []:
-                print(f'  {c["channel_id"]}  {c["name"]}')
-            print(f'  -> "{g["name"]}": {json.dumps(ids)},')
+                print(f'    {c["channel_id"]}  {c["name"]}')
+            print(f'    -> "{g["name"]}": {json.dumps(ids)},')
         elif "subscription_channel" in s:
             c = s["subscription_channel"]
-            print(f'  {c["channel_id"]}  {c["name"]}  (未分组)')
+            print(f'    {c["channel_id"]}  {c["name"]}  (未分组)')
 
 
 # ---------------------------------------------------------------- 核心流程
 # 抽成独立函数，方便 supervisor.py 直接 import 调用，避免另起一个 Python
 # 进程(subprocess)——两个解释器同时常驻在内存紧张的环境里会直接顶爆限额。
+
+
 def run(
     out="./feeds",
     base_url="",
-    max_items=50,
+    per_channel=10,
+    feed_max=120,
     limit=10,
     delay=1.0,
     no_content=False,
@@ -397,8 +442,11 @@ def run(
     cache_path="./lw_cache.json",
     cache_max_age_days=14,
     notify_days=1,
+    entry_types=None,
 ):
+    entry_types = set(entry_types or DEFAULT_ENTRY_TYPES)
     headers = build_headers()
+
     notify_state_path = os.path.join(
         os.path.dirname(os.path.abspath(cache_path)), "lw_notify_state.json"
     )
@@ -406,6 +454,7 @@ def run(
 
     os.makedirs(out, exist_ok=True)
     cache = load_cache(cache_path)
+    cutoff = time.time() - cache_max_age_days * 86400 if cache_max_age_days > 0 else 0
 
     # link_only/no_content 模式下不需要正文，把已缓存条目里的 html 直接清空。
     # 这一行是"自愈"：哪怕磁盘上的缓存文件是之前全文模式攒下的大文件，
@@ -415,54 +464,132 @@ def run(
             v["html"] = ""
 
     new_details = 0
+    failed_details = 0
+    type_hist = {}
 
     for name, channel_ids in GROUPS.items():
-        print(f"[{name}] 拉取中…", file=sys.stderr)
-        raw = fetch_feed(headers, channel_ids, max_items, limit, delay)
-        entries = []
+        print(f"[{name}] 拉取中… ({len(channel_ids)} 个号)", file=sys.stderr)
+        group_new = 0
 
-        for it in raw:
-            if it.get("entry_type") != 7:  # 7 = 文章，其它是专题聚合
+        for cid in channel_ids:
+            try:
+                raw = fetch_channel_feed(
+                    headers, cid, per_channel, limit, delay, cutoff=cutoff
+                )
+            except Exception as e:  # noqa: BLE001
+                # 单个号失败不该拖垮整组：本轮跳过，缓存里的旧条目照常出 feed，
+                # 下一轮再补。
+                print(f"  [!] 列表失败 {cid}: {e}", file=sys.stderr)
                 continue
-            eid = it["entry_id"]
-            row = {
-                "entry_id": eid,
-                "title": it.get("title"),
-                "pub_time": it.get("pub_time"),
-                "channel": (it.get("channel") or {}).get("name", ""),
-                "abstract": (it.get("abstract") or "")
-                .replace("<hl>", "")
-                .replace("</hl>", ""),
-            }
 
-            if eid in cache:
-                row.update(cache[eid])
-                # 老条目可能是升级前缓存的，没有 pub_time，借这次机会补上，
-                # 否则永远进不了下面的按时间清理逻辑，缓存会一直有增无减
-                cache[eid].setdefault("pub_time", it.get("pub_time"))
-            elif not no_content:
-                try:
-                    res = fetch_detail(headers, eid, it["entry_type"])
-                    d = {
-                        # 语鲸返回的是 http，换成 https 只是去掉一个明显的
-                        # "机器访问"信号，不能根治环境异常校验，但没有副作用
-                        "orig_url": res.get("orig_url", "").replace(
-                            "http://mp.weixin.qq.com", "https://mp.weixin.qq.com", 1
-                        ),
-                        "author": (res.get("author") or {}).get("name", ""),
-                        # link_only 模式下不需要正文，压根不存，
-                        # 而不是存了再在输出阶段丢弃——减少的是缓存本身的体积
-                        "html": "" if link_only else res.get("html", ""),
-                        "pub_time": it.get("pub_time"),
-                    }
-                    cache[eid] = d
-                    row.update(d)
-                    new_details += 1
-                    time.sleep(delay)
-                except Exception as e:  # noqa: BLE001
-                    print(f"  详情失败 {eid}: {e}", file=sys.stderr)
+            kept = 0
+            for it in raw:
+                et = it.get("entry_type")
+                type_hist[et] = type_hist.get(et, 0) + 1
+                if et not in entry_types:
+                    continue
 
-            entries.append(row)
+                eid = it.get("entry_id")
+                if not eid:
+                    continue
+                kept += 1
+
+                meta = {
+                    "entry_id": eid,
+                    "title": it.get("title"),
+                    "pub_time": it.get("pub_time"),
+                    "channel": (it.get("channel") or {}).get("name", ""),
+                    "abstract": (it.get("abstract") or "")
+                    .replace("<hl>", "")
+                    .replace("</hl>", ""),
+                    "group": name,
+                }
+
+                row = cache.get(eid)
+                if row is not None:
+                    # 老条目：补齐列表侧字段（旧版缓存只存了正文相关的几项，
+                    # 没有 title/group 就没法从缓存重建 feed）
+                    for k, v in meta.items():
+                        if v or k not in row:
+                            row[k] = v
+                    need_detail = not no_content and not row.get("orig_url")
+                else:
+                    row = dict(meta)
+                    row.setdefault("orig_url", "")
+                    row.setdefault("author", "")
+                    row.setdefault("html", "")
+                    need_detail = not no_content
+
+                if need_detail:
+                    try:
+                        res = fetch_detail(headers, eid, et)
+                        row.update(
+                            {
+                                # 语鲸返回的是 http，换成 https 只是去掉一个明显的
+                                # "机器访问"信号，不能根治环境异常校验，但没有副作用
+                                "orig_url": res.get("orig_url", "").replace(
+                                    "http://mp.weixin.qq.com",
+                                    "https://mp.weixin.qq.com",
+                                    1,
+                                ),
+                                "author": (res.get("author") or {}).get("name", ""),
+                                # link_only 模式下不需要正文，压根不存，
+                                # 而不是存了再在输出阶段丢弃——减少的是缓存本身的体积
+                                "html": "" if link_only else res.get("html", ""),
+                            }
+                        )
+                        new_details += 1
+                        group_new += 1
+                        time.sleep(delay)
+                    except Exception as e:  # noqa: BLE001
+                        # 关键改动：拿不到 orig_url 就先不写进 feed。
+                        # 旧版会输出一条没有 <link> 的条目，Miniflux 按 GUID 落库后
+                        # 即使下轮补到链接也未必回填，肉眼看就是"这篇丢了"。
+                        # 这里仍然写缓存（保留 title/pub_time），orig_url 为空，
+                        # 输出阶段会跳过它，下一轮自动重试详情。
+                        failed_details += 1
+                        print(f"  [!] 详情失败 {eid}: {e}", file=sys.stderr)
+
+                cache[eid] = row
+
+            if kept:
+                print(f"  {cid}: +{kept}", file=sys.stderr)
+            time.sleep(delay)
+
+            del raw
+
+        print(f"[{name}] 本轮新增详情 {group_new} 条", file=sys.stderr)
+        gc.collect()
+
+    # ------------------------------------------------------------ 清理缓存
+    # 按发布时间清理过期条目，防止 lw_cache.json 无限增长。
+    # 缓存现在同时是 feed 的数据源，所以 cache_max_age_days 直接决定了
+    # 订阅源里能看到多久以前的文章。
+    if cache_max_age_days > 0:
+        before = len(cache)
+        cache = {
+            k: v for k, v in cache.items() if (v.get("pub_time") or cutoff) >= cutoff
+        }
+        removed = before - len(cache)
+        if removed:
+            print(
+                f"清理过期缓存 {removed} 条(保留最近 {cache_max_age_days} 天)",
+                file=sys.stderr,
+            )
+
+    save_cache(cache_path, cache)
+
+    # ------------------------------------------------------------ 输出 feed
+    # 从缓存出，而不是只写"本次抓到的"。这样一次抓取失败、或者两次运行之间
+    # 隔了一整夜，都不会让中间的文章永久消失。
+    for name in GROUPS:
+        entries = [
+            v
+            for v in cache.values()
+            if v.get("group") == name and (v.get("orig_url") or no_content)
+        ]
+        entries.sort(key=lambda e: e.get("pub_time") or 0, reverse=True)
+        entries = entries[:feed_max]
 
         self_url = f"{base_url.rstrip('/')}/{name}.atom" if base_url else ""
         xml = build_atom(f"语鲸 - {name}", self_url, entries)
@@ -471,25 +598,24 @@ def run(
             f.write(xml)
         print(f"[{name}] {len(entries)} 篇 -> {path}", file=sys.stderr)
 
-        # 组间显式回收：raw/entries 本轮已写盘，尽快归还内存池，
-        # 而不是等垃圾回收器自己判断时机——在紧张的内存限额下这点很重要
-        del raw, entries
+        del entries, xml
         gc.collect()
 
-    # 按发布时间清理过期缓存条目，防止 lw_cache.json 无限增长。
-    # 这是这次 OOM 的根本原因：缓存从不清理，天数越多、常驻内存越高。
-    if cache_max_age_days > 0:
-        cutoff = time.time() - cache_max_age_days * 86400
-        before = len(cache)
-        cache = {
-            k: v for k, v in cache.items() if (v.get("pub_time") or cutoff) >= cutoff
-        }
-        removed = before - len(cache)
-        if removed:
-            print(f"清理过期缓存 {removed} 条(保留最近 {cache_max_age_days} 天)", file=sys.stderr)
-
-    save_cache(cache_path, cache)
-    print(f"完成，新增详情 {new_details} 条，缓存共 {len(cache)} 条", file=sys.stderr)
+    pending = sum(
+        1 for v in cache.values() if not v.get("orig_url") and not no_content
+    )
+    print(
+        f"完成，新增详情 {new_details} 条，详情失败 {failed_details} 条，"
+        f"待补链接 {pending} 条，缓存共 {len(cache)} 条",
+        file=sys.stderr,
+    )
+    if type_hist:
+        hist = ", ".join(f"{k}:{v}" for k, v in sorted(type_hist.items(), key=str))
+        print(
+            f"entry_type 分布 {hist}（当前只放行 {sorted(entry_types)}，"
+            f"若有推送始终不出现，用 --entry-types 放行对应类型）",
+            file=sys.stderr,
+        )
 
 
 def run_from_args(args):
@@ -498,10 +624,14 @@ def run_from_args(args):
         check_token_expiry()
         list_channels(headers)
         return
+
+    entry_types = {int(x) for x in args.entry_types.split(",") if x.strip()}
+
     run(
         out=args.out,
         base_url=args.base_url,
-        max_items=args.max_items,
+        per_channel=args.per_channel,
+        feed_max=args.feed_max,
         limit=args.limit,
         delay=args.delay,
         no_content=args.no_content,
@@ -509,15 +639,29 @@ def run_from_args(args):
         cache_path=args.cache,
         cache_max_age_days=args.cache_max_age_days,
         notify_days=args.notify_days,
+        entry_types=entry_types,
     )
 
 
 # ---------------------------------------------------------------- 命令行入口
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="./feeds", help="输出目录")
     ap.add_argument("--base-url", default="", help="feed 的公开访问前缀")
-    ap.add_argument("--max-items", type=int, default=50, help="每个 feed 最多条数")
+    ap.add_argument(
+        "--per-channel",
+        type=int,
+        default=10,
+        help="每个公众号每轮最多拉多少条(取代旧的 --max-items)",
+    )
+    ap.add_argument(
+        "--feed-max",
+        type=int,
+        default=120,
+        help="每个 .atom 文件最多输出多少条(从缓存里按时间倒序取)",
+    )
     ap.add_argument("--limit", type=int, default=10, help="每页条数")
     ap.add_argument("--delay", type=float, default=1.0, help="请求间隔秒")
     ap.add_argument("--no-content", action="store_true", help="不取详情(无链接/无正文)")
@@ -531,7 +675,12 @@ def main():
         "--cache-max-age-days",
         type=int,
         default=14,
-        help="缓存条目保留天数，超过则清理(0=不清理，不建议)",
+        help="缓存条目保留天数(同时决定 feed 里能看到多久以前的文章)",
+    )
+    ap.add_argument(
+        "--entry-types",
+        default=",".join(str(t) for t in sorted(DEFAULT_ENTRY_TYPES)),
+        help="放行的 entry_type，逗号分隔。7=文章",
     )
     ap.add_argument(
         "--notify-days",

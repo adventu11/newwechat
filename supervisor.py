@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
 supervisor —— 在容器里同时做两件事：
-  1. 按固定时间点（默认 8/12/17 点，Asia/Shanghai）跑一次 lingowhale2rss.py
+  1. 按固定时间点（默认 7/10/13/16/19/22 点，Asia/Shanghai）跑一次 lingowhale2rss
   2. 用内置 HTTP 服务器把生成的 .atom 文件暴露出去，给 Miniflux 订阅
 
 只用标准库，不依赖系统 cron，避免 Alpine 装 cron 包和时区配置的额外坑。
+
+本版改动:
+  - 默认抓取频率从 3 次/天提到 6 次/天。配合 feed 现在从缓存出，
+    夜里 22:00→次日 07:00 的空档不会再丢文章，但缩短窗口能让新文章更快进
+    Miniflux，也让单轮的请求量更平均。
+  - 新增 LW_PER_CHANNEL / LW_FEED_MAX / LW_ENTRY_TYPES 三个环境变量，
+    LW_MAX_ITEMS 已废弃（它是整组共享配额，正是漏文章的根源）。
 """
 
 import base64
@@ -27,7 +34,7 @@ except Exception:  # noqa: BLE001
     TZ = None
     print("[!] zoneinfo 不可用，退回本地时区，请确认容器 TZ 设置正确", flush=True)
 
-RUN_HOURS = [int(h) for h in os.environ.get("LW_RUN_HOURS", "8,12,17").split(",")]
+RUN_HOURS = [int(h) for h in os.environ.get("LW_RUN_HOURS", "7,10,13,16,19,22").split(",")]
 DATA_DIR = os.environ.get("LW_DATA_DIR", "/app/data")
 FEEDS_DIR = os.path.join(DATA_DIR, "feeds")
 CACHE_PATH = os.path.join(DATA_DIR, "lw_cache.json")
@@ -103,11 +110,23 @@ def next_run(t):
 
 def run_job():
     print(f"[{now()}] 开始抓取", flush=True)
+    if os.environ.get("LW_MAX_ITEMS"):
+        print(
+            "[!] LW_MAX_ITEMS 已废弃(整组共享配额是漏文章的根源)，"
+            "请改用 LW_PER_CHANNEL / LW_FEED_MAX",
+            flush=True,
+        )
     try:
+        entry_types = {
+            int(x)
+            for x in os.environ.get("LW_ENTRY_TYPES", "7").split(",")
+            if x.strip()
+        }
         lw2r.run(
             out=FEEDS_DIR,
             base_url=os.environ.get("LW_BASE_URL", ""),
-            max_items=int(os.environ.get("LW_MAX_ITEMS", "30")),
+            per_channel=int(os.environ.get("LW_PER_CHANNEL", "10")),
+            feed_max=int(os.environ.get("LW_FEED_MAX", "120")),
             limit=int(os.environ.get("LW_LIMIT", "10")),
             delay=float(os.environ.get("LW_DELAY", "1.0")),
             no_content=os.environ.get("LW_NO_CONTENT") == "1",
@@ -115,6 +134,7 @@ def run_job():
             cache_path=CACHE_PATH,
             cache_max_age_days=int(os.environ.get("LW_CACHE_MAX_AGE_DAYS", "14")),
             notify_days=int(os.environ.get("LW_NOTIFY_DAYS", "1")),
+            entry_types=entry_types,
         )
         print(f"[{now()}] 抓取完成", flush=True)
     except SystemExit as e:
