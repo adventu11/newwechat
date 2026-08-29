@@ -12,6 +12,9 @@ supervisor —— 在容器里同时做两件事：
     Miniflux，也让单轮的请求量更平均。
   - 新增 LW_PER_CHANNEL / LW_FEED_MAX / LW_ENTRY_TYPES 三个环境变量，
     LW_MAX_ITEMS 已废弃（它是整组共享配额，正是漏文章的根源）。
+  - 分组自动同步。LW_AUTO_GROUPS=0 退回代码内置分组；
+    LW_INCLUDE_UNGROUPED=0 不给未分组的号出 feed；
+    LW_PRUNE_FEEDS=0 保留分组改名后遗留的旧 .atom。
 """
 
 import base64
@@ -135,6 +138,9 @@ def run_job():
             cache_max_age_days=int(os.environ.get("LW_CACHE_MAX_AGE_DAYS", "14")),
             notify_days=int(os.environ.get("LW_NOTIFY_DAYS", "1")),
             entry_types=entry_types,
+            auto_groups=os.environ.get("LW_AUTO_GROUPS", "1") != "0",
+            include_ungrouped=os.environ.get("LW_INCLUDE_UNGROUPED", "1") != "0",
+            prune_feeds=os.environ.get("LW_PRUNE_FEEDS", "1") != "0",
         )
         print(f"[{now()}] 抓取完成", flush=True)
     except SystemExit as e:

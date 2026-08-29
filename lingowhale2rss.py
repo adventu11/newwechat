@@ -15,16 +15,13 @@ lingowhale2rss —— 把语鲸订阅的公众号转成 Atom 订阅源
 生成的 .atom 文件放到任意静态服务器下，Miniflux 订阅即可。
 
 --------------------------------------------------------------------------
-本版针对"部分文章漏抓"做了四处结构性修改:
+分组现在是【自动同步】的:
+  每轮抓取前先调 user_subscribe/list，用语鲸端当前的分组结构生成本轮任务。
+  在语鲸里新建分组、往分组里加号、把号挪到别的分组，下一轮自动生效，
+  不需要改代码。分组改名后 .atom 文件名跟着变(见 NAME_MAP 一节)。
 
-1. 逐个 channel 拉取，而不是把整组 channel_ids 混在一起拉前 N 条。
-   旧写法下 yiyao 组 32 个号共享 30 条配额，日更号会把低频号挤出窗口。
-2. Atom 从缓存出，而不是只写"本次抓到的"。缓存保留 14 天，因此单次抓取
-   失败、或两次运行之间的时间窗口过长，都不会再造成文章永久丢失。
-3. 详情抓取失败的条目不再写进 feed（旧版会输出一条没有 <link> 的条目，
-   Miniflux 落库后即使下次成功也未必回填链接），改为跳过、下次重试。
-4. entry_type 过滤可配置，并统计被过滤掉的类型，方便确认多图文次条、
-   专题聚合等是不是被误杀。
+  代码里的 FALLBACK_GROUPS 只在接口拉不到、且磁盘上也没有上一轮快照时兜底，
+  日常不用维护。想回到旧的手工模式: --no-auto-groups
 --------------------------------------------------------------------------
 """
 
@@ -52,81 +49,35 @@ SORT_TYPE = 2
 
 # 允许进入 feed 的 entry_type。7 = 文章。
 # 如果发现某些推送始终不出现，先看运行日志末尾的"entry_type 分布"，
-# 把需要的类型号加进来即可（用 --entry-types 7,8 覆盖，无需改代码）。
+# 用 --entry-types 7,8 放行对应类型，无需改代码。
 DEFAULT_ENTRY_TYPES = {7}
 
-# ---------------------------------------------------------------- 分组配置
-# key = 输出的 feed 文件名(建议英文), value = channel_id 列表
-# 用 --list-channels 可重新打印当前账号下的所有 channel_id
-GROUPS = {
+# 没有归到任何分组的公众号，统一收进这个 feed
+UNGROUPED_NAME = "未分组"
+
+# ---------------------------------------------------------------- 文件名映射
+# 默认: .atom 文件名 = 语鲸端的分组名(经过路径字符清洗)。分组改名 → 文件名跟着变
+# → Miniflux 里的订阅 URL 会失效，需要重新订阅一次。
+#
+# 如果某个分组你希望文件名永远钉死(比如已经在 Miniflux 里订阅好了不想动)，
+# 在这里写一条映射即可，它优先于分组名:
+#     NAME_MAP = {"医药": "yiyao", "注册": "zhuce"}
+NAME_MAP = {}
+
+# ---------------------------------------------------------------- 兜底分组
+# 仅在 user_subscribe/list 拉取失败、且磁盘上也没有上一轮的分组快照时使用。
+# 平时不用维护这里。
+FALLBACK_GROUPS = {
     "yiyao": [
         "682b68f7da6f685c6aed8e4f",  # 21新健康
-        "6969972d784e4c64543c7510",  # Briinsight
-        "67cc08b69a4297b6148b4b21",  # 医药笔记
-        "67f72ad8cae6ac82234c91c7",  # CMAC发布
         "67cc08ae9a4297b6148b3da7",  # 药明康德
         "67cc08ae9a4297b6148b3eb8",  # E药经理人
-        "67f61fd5291555e5370a23e5",  # 医药投资部落
-        "6891f758da9a363d9d73ac31",  # 金玉良研
-        "683d96ec7f29ff293410775c",  # 中国食品药品监管杂志
-        "67ce97d19133eb94ea6e113a",  # 同写意
-        "689fdf2050a99184e313384f",  # 新浪医药
-        "6879f8342731550460eba1d1",  # 乐城先行区管理局发布
-        "67cc08b69a4297b6148b4b20",  # 丁香园 Insight 数据库
-        "69952d0409487f1311b19250",  # PV行者
-        "6822f1230fad9d73f5cfc17e",  # BiG生物创新社
-        "682c8918f38a13a2ad655977",  # 佰傲谷BioValley
-        "67cc08ae9a4297b6148b3e8a",  # 医药健闻
-        "67cc08ac9a4297b6148b3a4f",  # 深蓝观
-        "6822ddc92a4055faa7032e61",  # 医药观澜
         "67cc08ae9a4297b6148b3e05",  # 医药魔方
-        "67cc08a49a4297b6148b2df7",  # VIP说
-        "6a50814c6818a65c9ce6cd2f",  # DIA资讯
-        "6a5084e813e73afc68e07646",  # 制药台
-        "6a508005393401f4b8118e6f",  # 奥来恩医药
-        "6a5086b36818a65c9ce6dcef",  # 沪上临研人
-        "6a3a1f95cae9209922735445",  # NOVOTECH诺为泰
-        "6a40c6beed5e6ba8031e3056",  # 药政沙龙
-        "6a393cf6cae920992270ea52",  # 有临医药
-        "6a50829b393401f4b81195f9",  # Ainusen医药
-        "6a5081146818a65c9ce6ccc4",  # 东药西毒
-        "6a5080fb6818a65c9ce6cc7b",  # DTRIAL PHARMA
-        "6a5085a0393401f4b8119eca",  # PV人儿
-    ],
-    "cro": [
-        "69057be581154864e97fff1e",  # 泰格医药
-        "67ce97d19133eb94ea6e113e",  # IQVIA艾昆纬
-        "6a50824713e73afc68e06e9e",  # Caidya康缔亚
-        "6a508269393401f4b8119563",  # 北京海金格医药
-        "6a5085b26818a65c9ce6db1e",  # 普瑞盛GCPClinPlus
-        "6a50872f393401f4b811a1f5",  # ICON爱恩康医学
-        "6a584f912093ad6c4d121c3e",  # Parexel
-        "6a5085f2393401f4b8119f3d",  # 昆拓医药研发
-        "6a5080e16818a65c9ce6cc55",  # 富启睿Fortrea
+        "67cc08ac9a4297b6148b3a4f",  # 深蓝观
     ],
     "zhuce": [
         "6814e26c9c69993601c767ce",  # 注册圈
         "6814e28a288f7f1429cfe82f",  # iReg
-        "6a50852813e73afc68e076bd",  # 杨晴的注册研习社
-        "6a50858b393401f4b8119ea8",  # RA-Li
-        "6a5084b06818a65c9ce6d90e",  # 注册法规杂谈123
-    ],
-    "za": [
-        "67cc08b49a4297b6148b47fc",  # 不坑老师
-        "689c0fd9124d4c92decbe3f0",  # 知彼而知己
-        "67cc08a19a4297b6148b299c",  # 腾讯研究院
-        "6a5085d513e73afc68e078ca",  # 码海听潮
-        "6a508282393401f4b81195d1",  # APP喵
-    ],
-    "qita": [
-        "67cc08ae9a4297b6148b3e32",  # 研发客
-        "67cc08b09a4297b6148b40c3",  # 生物技术小编
-        "68a5f0e0a8e586f9f6ea1724",  # 药闻资讯
-        "67cc08b39a4297b6148b4684",  # 药事纵横
-        "6822f092f162e4a82732479f",  # 药智数据
-        "6a5d66ff1466736b89488b6a",  # 药政work幻想家Annie.zhong
-        "6a5d668bac9875af5a9be87d",  # Susan法研社
-        "6a50853e13e73afc68e076e6",  # 文森特谈临研
     ],
 }
 
@@ -230,18 +181,23 @@ def send_wechat_notify(title, content):
         return False
 
 
-def load_notify_state(path):
+# ---------------------------------------------------------------- JSON 落盘
+
+
+def load_json(path, default=None):
+    if not path:
+        return {} if default is None else default
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception:  # noqa: BLE001
-        return {}
+        return {} if default is None else default
 
 
-def save_notify_state(path, state):
+def save_json(path, obj):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f)
+        json.dump(obj, f, ensure_ascii=False)
     os.replace(tmp, path)
 
 
@@ -253,10 +209,10 @@ def check_token_expiry(notify_state_path=None, notify_days=1):
     检查 LW_ACCESS_TOKEN / LW_AUTH_TOKEN 的剩余有效期。
 
     剩余天数跌破 notify_days 时推一条微信消息；用 notify_state_path 记录
-    "这个 exp 值是否已经通知过"，避免一天跑 3 次调度就收到 3 条重复消息——
+    "这个 exp 值是否已经通知过"，避免一天跑多次调度就收到多条重复消息——
     只有换了新令牌(exp 变化)才会重新触发提醒。
     """
-    state = load_notify_state(notify_state_path) if notify_state_path else {}
+    state = load_json(notify_state_path) if notify_state_path else {}
     state_changed = False
 
     for env_key, label in (
@@ -295,7 +251,151 @@ def check_token_expiry(notify_state_path=None, notify_days=1):
                     state_changed = True
 
     if state_changed and notify_state_path:
-        save_notify_state(notify_state_path, state)
+        save_json(notify_state_path, state)
+
+
+# ---------------------------------------------------------------- 分组同步
+
+
+def parse_subscriptions(data, include_ungrouped=True):
+    """
+    把 user_subscribe/list 的返回拍平成 ({分组名: [channel_id]}, {channel_id: 号名})。
+
+    同一个号被放进多个分组是允许的——抓取时按 channel 去重只拉一次，
+    输出时按分组各出一份，不会重复请求。
+    """
+    groups = {}
+    names = {}  # channel_id -> 公众号名，用于日志和排错
+
+    for s in data.get("user_subscribes") or []:
+        if "subscription_group" in s:
+            g = s["subscription_group"] or {}
+            name = (g.get("name") or "").strip()
+            if not name:
+                continue
+            bucket = groups.setdefault(name, [])
+            for c in g.get("channels") or []:
+                cid = c.get("channel_id")
+                if not cid:
+                    continue
+                names[cid] = c.get("name") or ""
+                if cid not in bucket:
+                    bucket.append(cid)
+        elif "subscription_channel" in s and include_ungrouped:
+            c = s["subscription_channel"] or {}
+            cid = c.get("channel_id")
+            if not cid:
+                continue
+            names[cid] = c.get("name") or ""
+            bucket = groups.setdefault(UNGROUPED_NAME, [])
+            if cid not in bucket:
+                bucket.append(cid)
+
+    groups = {k: v for k, v in groups.items() if v}  # 空分组不生成文件
+    return groups, names
+
+
+def fetch_groups(headers, include_ungrouped=True):
+    data = post(SUBS_EP, headers, {"sort_type": SORT_TYPE})
+    return parse_subscriptions(data, include_ungrouped=include_ungrouped)
+
+
+def diff_groups(old, new, names):
+    """打印分组结构的变化，一眼确认自动同步是否真的生效。"""
+    if not old:
+        print(f"分组快照初始化: {len(new)} 组", file=sys.stderr)
+        return
+
+    old_names, new_names = set(old), set(new)
+    for n in sorted(new_names - old_names):
+        print(f"[同步] 新增分组 {n} ({len(new[n])} 个号)", file=sys.stderr)
+    for n in sorted(old_names - new_names):
+        print(
+            f"[同步] 分组消失 {n}（改名或已删除，旧 .atom 会被清理）", file=sys.stderr
+        )
+
+    for n in sorted(new_names & old_names):
+        added = [c for c in new[n] if c not in old[n]]
+        removed = [c for c in old[n] if c not in new[n]]
+        for c in added:
+            print(f"[同步] {n} 新增公众号 {names.get(c) or c}", file=sys.stderr)
+        if removed:
+            print(f"[同步] {n} 移除 {len(removed)} 个号", file=sys.stderr)
+
+
+def resolve_groups(headers, auto=True, include_ungrouped=True, snapshot_path=None):
+    """
+    返回本轮要抓的 ({分组名: [channel_id]}, {channel_id: 号名})。
+
+    优先用接口实时同步；接口挂了就退回磁盘上的上一轮快照；快照也没有才用
+    代码里的 FALLBACK_GROUPS。这层兜底很重要——否则订阅接口一次抽风就会让
+    所有 feed 变成空文件，Miniflux 那边看着就像文章集体消失。
+    """
+    if not auto:
+        return dict(FALLBACK_GROUPS), {}
+
+    try:
+        groups, names = fetch_groups(headers, include_ungrouped=include_ungrouped)
+        if not groups:
+            raise RuntimeError("接口返回的订阅列表为空")
+        if snapshot_path:
+            diff_groups(load_json(snapshot_path), groups, names)
+            save_json(snapshot_path, groups)
+        total = sum(len(v) for v in groups.values())
+        print(f"分组同步完成: {len(groups)} 组 / {total} 个订阅位", file=sys.stderr)
+        return groups, names
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        print(f"[!] 分组同步失败: {e}", file=sys.stderr)
+
+    snapshot = load_json(snapshot_path) if snapshot_path else {}
+    if snapshot:
+        print(f"[!] 退回上一轮分组快照 ({len(snapshot)} 组)", file=sys.stderr)
+        return snapshot, {}
+
+    print("[!] 无快照可用，退回代码内置的 FALLBACK_GROUPS", file=sys.stderr)
+    return dict(FALLBACK_GROUPS), {}
+
+
+def safe_filename(name):
+    """分组名 → 文件名。清掉路径分隔符和 Windows 非法字符，空白折成下划线。"""
+    s = (name or "").strip()
+    for ch in '/\\:*?"<>|\r\n\t':
+        s = s.replace(ch, "_")
+    s = "_".join(s.split())
+    s = s.strip(". ")
+    return s or "group"
+
+
+def feed_filenames(groups):
+    """{分组名: 文件名(不含扩展名)}，处理 NAME_MAP 覆盖和清洗后的重名冲突。"""
+    used, out = set(), {}
+    for name in groups:
+        base = NAME_MAP.get(name) or safe_filename(name)
+        slug, i = base, 2
+        while slug in used:
+            slug = f"{base}_{i}"
+            i += 1
+        used.add(slug)
+        out[name] = slug
+    return out
+
+
+def prune_feed_files(out_dir, keep):
+    """删掉不再对应任何分组的 .atom（分组改名/删除后留下的孤儿文件）"""
+    keep = {f"{s}.atom" for s in keep}
+    try:
+        existing = os.listdir(out_dir)
+    except OSError:
+        return
+    for fn in existing:
+        if fn.endswith(".atom") and fn not in keep:
+            try:
+                os.remove(os.path.join(out_dir, fn))
+                print(f"[清理] 删除孤儿 feed {fn}", file=sys.stderr)
+            except OSError as e:  # noqa: PERF203
+                print(f"[!] 删除 {fn} 失败: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------- 拉取
@@ -305,11 +405,10 @@ def fetch_channel_feed(headers, channel_id, max_items, limit, delay, cutoff=0):
     """
     按 cursor 翻页拉【单个公众号】的文章列表。
 
-    单号拉取是这版的核心改动：旧版把整组 channel_ids 一起丢给接口再取前 N 条，
+    单号拉取是关键: 旧版把整组 channel_ids 一起丢给接口再取前 N 条，
     等于让同组所有号抢一个配额，日更号必然把低频号挤掉。
 
-    cutoff: unix 时间戳。翻到比它更老的文章就停——反正缓存也只保留这么久，
-    再往前翻纯属浪费请求额度。
+    cutoff: unix 时间戳。翻到比它更老的文章就停——反正缓存也只保留这么久。
     """
     items, cursor = [], ""
     while len(items) < max_items:
@@ -345,23 +444,6 @@ def fetch_detail(headers, entry_id, entry_type):
     url = f"{DETAIL_EP}?entry_id={entry_id}&entry_type={entry_type}"
     data = post(url, headers, {})
     return data.get("resource") or {}
-
-
-def load_cache(path):
-    if os.path.exists(path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:  # noqa: BLE001
-            pass
-    return {}
-
-
-def save_cache(path, cache):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False)
-    os.replace(tmp, path)
 
 
 # ---------------------------------------------------------------- Atom
@@ -411,18 +493,11 @@ def build_atom(title, self_url, entries):
 
 
 def list_channels(headers):
-    data = post(SUBS_EP, headers, {"sort_type": SORT_TYPE})
-    for s in data.get("user_subscribes") or []:
-        if "subscription_group" in s:
-            g = s["subscription_group"]
-            print(f'\n# 分组: {g["name"]}')
-            ids = [c["channel_id"] for c in (g.get("channels") or [])]
-            for c in g.get("channels") or []:
-                print(f'    {c["channel_id"]}  {c["name"]}')
-            print(f'    -> "{g["name"]}": {json.dumps(ids)},')
-        elif "subscription_channel" in s:
-            c = s["subscription_channel"]
-            print(f'    {c["channel_id"]}  {c["name"]}  (未分组)')
+    groups, names = fetch_groups(headers, include_ungrouped=True)
+    for name, ids in groups.items():
+        print(f"\n# 分组: {name}  ({len(ids)} 个号)  -> {safe_filename(name)}.atom")
+        for cid in ids:
+            print(f"    {cid}  {names.get(cid, '')}")
 
 
 # ---------------------------------------------------------------- 核心流程
@@ -443,123 +518,138 @@ def run(
     cache_max_age_days=14,
     notify_days=1,
     entry_types=None,
+    auto_groups=True,
+    include_ungrouped=True,
+    prune_feeds=True,
 ):
     entry_types = set(entry_types or DEFAULT_ENTRY_TYPES)
     headers = build_headers()
 
-    notify_state_path = os.path.join(
-        os.path.dirname(os.path.abspath(cache_path)), "lw_notify_state.json"
-    )
+    data_dir = os.path.dirname(os.path.abspath(cache_path))
+    notify_state_path = os.path.join(data_dir, "lw_notify_state.json")
+    snapshot_path = os.path.join(data_dir, "lw_groups.json")
     check_token_expiry(notify_state_path=notify_state_path, notify_days=notify_days)
 
     os.makedirs(out, exist_ok=True)
-    cache = load_cache(cache_path)
+
+    groups, channel_names = resolve_groups(
+        headers,
+        auto=auto_groups,
+        include_ungrouped=include_ungrouped,
+        snapshot_path=snapshot_path if auto_groups else None,
+    )
+    slugs = feed_filenames(groups)
+
+    cache = load_json(cache_path)
     cutoff = time.time() - cache_max_age_days * 86400 if cache_max_age_days > 0 else 0
 
     # link_only/no_content 模式下不需要正文，把已缓存条目里的 html 直接清空。
     # 这一行是"自愈"：哪怕磁盘上的缓存文件是之前全文模式攒下的大文件，
-    # 本次运行加载进内存后立刻瘦身，且下面 save_cache() 会把瘦身结果写回磁盘。
+    # 本次运行加载进内存后立刻瘦身，且下面 save_json() 会把瘦身结果写回磁盘。
     if link_only or no_content:
         for v in cache.values():
             v["html"] = ""
+
+    # 同一个号可能同时属于多个分组，按 channel 去重，只拉一次
+    all_channels = []
+    for ids in groups.values():
+        for cid in ids:
+            if cid not in all_channels:
+                all_channels.append(cid)
 
     new_details = 0
     failed_details = 0
     type_hist = {}
 
-    for name, channel_ids in GROUPS.items():
-        print(f"[{name}] 拉取中… ({len(channel_ids)} 个号)", file=sys.stderr)
-        group_new = 0
+    print(f"开始抓取 {len(all_channels)} 个公众号…", file=sys.stderr)
+    for cid in all_channels:
+        label = channel_names.get(cid) or cid
+        try:
+            raw = fetch_channel_feed(
+                headers, cid, per_channel, limit, delay, cutoff=cutoff
+            )
+        except Exception as e:  # noqa: BLE001
+            # 单个号失败不该拖垮全局：本轮跳过，缓存里的旧条目照常出 feed，
+            # 下一轮再补。
+            print(f"  [!] 列表失败 {label}: {e}", file=sys.stderr)
+            continue
 
-        for cid in channel_ids:
-            try:
-                raw = fetch_channel_feed(
-                    headers, cid, per_channel, limit, delay, cutoff=cutoff
-                )
-            except Exception as e:  # noqa: BLE001
-                # 单个号失败不该拖垮整组：本轮跳过，缓存里的旧条目照常出 feed，
-                # 下一轮再补。
-                print(f"  [!] 列表失败 {cid}: {e}", file=sys.stderr)
+        kept = 0
+        for it in raw:
+            et = it.get("entry_type")
+            type_hist[et] = type_hist.get(et, 0) + 1
+            if et not in entry_types:
                 continue
 
-            kept = 0
-            for it in raw:
-                et = it.get("entry_type")
-                type_hist[et] = type_hist.get(et, 0) + 1
-                if et not in entry_types:
-                    continue
+            eid = it.get("entry_id")
+            if not eid:
+                continue
+            kept += 1
 
-                eid = it.get("entry_id")
-                if not eid:
-                    continue
-                kept += 1
+            meta = {
+                "entry_id": eid,
+                # channel_id 是分组归属的唯一依据。存它而不是存分组名，
+                # 这样分组改名、或者把号挪到别的分组，老缓存都能自动跟着走。
+                "channel_id": cid,
+                "title": it.get("title"),
+                "pub_time": it.get("pub_time"),
+                "channel": (it.get("channel") or {}).get("name", ""),
+                "abstract": (it.get("abstract") or "")
+                .replace("<hl>", "")
+                .replace("</hl>", ""),
+            }
 
-                meta = {
-                    "entry_id": eid,
-                    "title": it.get("title"),
-                    "pub_time": it.get("pub_time"),
-                    "channel": (it.get("channel") or {}).get("name", ""),
-                    "abstract": (it.get("abstract") or "")
-                    .replace("<hl>", "")
-                    .replace("</hl>", ""),
-                    "group": name,
-                }
+            row = cache.get(eid)
+            if row is not None:
+                # 老条目：补齐列表侧字段（旧版缓存只存了正文相关的几项，
+                # 没有 channel_id/title 就没法从缓存重建 feed）
+                for k, v in meta.items():
+                    if v or k not in row:
+                        row[k] = v
+                need_detail = not no_content and not row.get("orig_url")
+            else:
+                row = dict(meta)
+                row.setdefault("orig_url", "")
+                row.setdefault("author", "")
+                row.setdefault("html", "")
+                need_detail = not no_content
 
-                row = cache.get(eid)
-                if row is not None:
-                    # 老条目：补齐列表侧字段（旧版缓存只存了正文相关的几项，
-                    # 没有 title/group 就没法从缓存重建 feed）
-                    for k, v in meta.items():
-                        if v or k not in row:
-                            row[k] = v
-                    need_detail = not no_content and not row.get("orig_url")
-                else:
-                    row = dict(meta)
-                    row.setdefault("orig_url", "")
-                    row.setdefault("author", "")
-                    row.setdefault("html", "")
-                    need_detail = not no_content
+            if need_detail:
+                try:
+                    res = fetch_detail(headers, eid, et)
+                    row.update(
+                        {
+                            # 语鲸返回的是 http，换成 https 只是去掉一个明显的
+                            # "机器访问"信号，不能根治环境异常校验，但没有副作用
+                            "orig_url": res.get("orig_url", "").replace(
+                                "http://mp.weixin.qq.com",
+                                "https://mp.weixin.qq.com",
+                                1,
+                            ),
+                            "author": (res.get("author") or {}).get("name", ""),
+                            # link_only 模式下不需要正文，压根不存，
+                            # 而不是存了再在输出阶段丢弃——减少的是缓存本身的体积
+                            "html": "" if link_only else res.get("html", ""),
+                        }
+                    )
+                    new_details += 1
+                    time.sleep(delay)
+                except Exception as e:  # noqa: BLE001
+                    # 拿不到 orig_url 就先不写进 feed。旧版会输出一条没有 <link>
+                    # 的条目，Miniflux 按 GUID 落库后即使下轮补到链接也未必回填，
+                    # 肉眼看就是"这篇丢了"。这里仍写缓存(留住标题/时间)，
+                    # orig_url 为空，输出阶段跳过，下一轮自动重试详情。
+                    failed_details += 1
+                    print(f"  [!] 详情失败 {eid}: {e}", file=sys.stderr)
 
-                if need_detail:
-                    try:
-                        res = fetch_detail(headers, eid, et)
-                        row.update(
-                            {
-                                # 语鲸返回的是 http，换成 https 只是去掉一个明显的
-                                # "机器访问"信号，不能根治环境异常校验，但没有副作用
-                                "orig_url": res.get("orig_url", "").replace(
-                                    "http://mp.weixin.qq.com",
-                                    "https://mp.weixin.qq.com",
-                                    1,
-                                ),
-                                "author": (res.get("author") or {}).get("name", ""),
-                                # link_only 模式下不需要正文，压根不存，
-                                # 而不是存了再在输出阶段丢弃——减少的是缓存本身的体积
-                                "html": "" if link_only else res.get("html", ""),
-                            }
-                        )
-                        new_details += 1
-                        group_new += 1
-                        time.sleep(delay)
-                    except Exception as e:  # noqa: BLE001
-                        # 关键改动：拿不到 orig_url 就先不写进 feed。
-                        # 旧版会输出一条没有 <link> 的条目，Miniflux 按 GUID 落库后
-                        # 即使下轮补到链接也未必回填，肉眼看就是"这篇丢了"。
-                        # 这里仍然写缓存（保留 title/pub_time），orig_url 为空，
-                        # 输出阶段会跳过它，下一轮自动重试详情。
-                        failed_details += 1
-                        print(f"  [!] 详情失败 {eid}: {e}", file=sys.stderr)
+            cache[eid] = row
 
-                cache[eid] = row
+        if kept:
+            print(f"  {label}: +{kept}", file=sys.stderr)
+        time.sleep(delay)
+        del raw
 
-            if kept:
-                print(f"  {cid}: +{kept}", file=sys.stderr)
-            time.sleep(delay)
-
-            del raw
-
-        print(f"[{name}] 本轮新增详情 {group_new} 条", file=sys.stderr)
-        gc.collect()
+    gc.collect()
 
     # ------------------------------------------------------------ 清理缓存
     # 按发布时间清理过期条目，防止 lw_cache.json 无限增长。
@@ -577,23 +667,25 @@ def run(
                 file=sys.stderr,
             )
 
-    save_cache(cache_path, cache)
+    save_json(cache_path, cache)
 
     # ------------------------------------------------------------ 输出 feed
     # 从缓存出，而不是只写"本次抓到的"。这样一次抓取失败、或者两次运行之间
     # 隔了一整夜，都不会让中间的文章永久消失。
-    for name in GROUPS:
+    for name, ids in groups.items():
+        idset = set(ids)
         entries = [
             v
             for v in cache.values()
-            if v.get("group") == name and (v.get("orig_url") or no_content)
+            if v.get("channel_id") in idset and (v.get("orig_url") or no_content)
         ]
         entries.sort(key=lambda e: e.get("pub_time") or 0, reverse=True)
         entries = entries[:feed_max]
 
-        self_url = f"{base_url.rstrip('/')}/{name}.atom" if base_url else ""
+        slug = slugs[name]
+        self_url = f"{base_url.rstrip('/')}/{slug}.atom" if base_url else ""
         xml = build_atom(f"语鲸 - {name}", self_url, entries)
-        path = os.path.join(out, f"{name}.atom")
+        path = os.path.join(out, f"{slug}.atom")
         with open(path, "w", encoding="utf-8") as f:
             f.write(xml)
         print(f"[{name}] {len(entries)} 篇 -> {path}", file=sys.stderr)
@@ -601,9 +693,10 @@ def run(
         del entries, xml
         gc.collect()
 
-    pending = sum(
-        1 for v in cache.values() if not v.get("orig_url") and not no_content
-    )
+    if prune_feeds:
+        prune_feed_files(out, slugs.values())
+
+    pending = sum(1 for v in cache.values() if not v.get("orig_url") and not no_content)
     print(
         f"完成，新增详情 {new_details} 条，详情失败 {failed_details} 条，"
         f"待补链接 {pending} 条，缓存共 {len(cache)} 条",
@@ -640,6 +733,9 @@ def run_from_args(args):
         cache_max_age_days=args.cache_max_age_days,
         notify_days=args.notify_days,
         entry_types=entry_types,
+        auto_groups=args.auto_groups,
+        include_ungrouped=args.include_ungrouped,
+        prune_feeds=args.prune_feeds,
     )
 
 
@@ -651,10 +747,7 @@ def main():
     ap.add_argument("--out", default="./feeds", help="输出目录")
     ap.add_argument("--base-url", default="", help="feed 的公开访问前缀")
     ap.add_argument(
-        "--per-channel",
-        type=int,
-        default=10,
-        help="每个公众号每轮最多拉多少条(取代旧的 --max-items)",
+        "--per-channel", type=int, default=10, help="每个公众号每轮最多拉多少条"
     )
     ap.add_argument(
         "--feed-max",
@@ -681,6 +774,24 @@ def main():
         "--entry-types",
         default=",".join(str(t) for t in sorted(DEFAULT_ENTRY_TYPES)),
         help="放行的 entry_type，逗号分隔。7=文章",
+    )
+    ap.add_argument(
+        "--no-auto-groups",
+        dest="auto_groups",
+        action="store_false",
+        help="不从接口同步分组，改用代码里的 FALLBACK_GROUPS",
+    )
+    ap.add_argument(
+        "--no-ungrouped",
+        dest="include_ungrouped",
+        action="store_false",
+        help=f"不为未分组的公众号生成 {UNGROUPED_NAME}.atom",
+    )
+    ap.add_argument(
+        "--no-prune",
+        dest="prune_feeds",
+        action="store_false",
+        help="保留分组改名/删除后遗留的旧 .atom 文件",
     )
     ap.add_argument(
         "--notify-days",
