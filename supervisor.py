@@ -39,6 +39,12 @@ except Exception as _e:  # noqa: BLE001
     print(f"[!] 日报模块不可用({_e})，本次仅抓取，不生成日报", flush=True)
 
 try:
+    import weekly as wkl
+except Exception as _e:  # noqa: BLE001
+    wkl = None
+    print(f"[!] 周报模块不可用({_e})，不生成周报", flush=True)
+
+try:
     from zoneinfo import ZoneInfo
 
     TZ = ZoneInfo("Asia/Shanghai")
@@ -77,6 +83,16 @@ def parse_times(spec, default):
 RUN_HOURS = parse_times(os.environ.get("LW_RUN_HOURS", "7,10,13,16,19,22"), "7,10,13,16,19,22")
 # 日报时间点。留空则不生成日报。默认 8 点——排在 7 点抓取之后，隔一小时够跑完
 REPORT_HOURS = parse_times(os.environ.get("LW_REPORT_HOURS", "8"), "8")
+# 周报时间点。LW_WEEKLY_DAY: 0=周一 ... 6=周日，默认周一 9:00。
+# 留空 LW_WEEKLY_HOURS 则不生成周报。
+WEEKLY_HOURS = parse_times(os.environ.get("LW_WEEKLY_HOURS", "9"), "9")
+try:
+    WEEKLY_DAY = int(os.environ.get("LW_WEEKLY_DAY", "0"))
+    if not 0 <= WEEKLY_DAY <= 6:
+        raise ValueError(WEEKLY_DAY)
+except Exception:  # noqa: BLE001
+    print("[!] LW_WEEKLY_DAY 无效，退回 0（周一）", flush=True)
+    WEEKLY_DAY = 0
 DATA_DIR = os.environ.get("LW_DATA_DIR", "/app/data")
 FEEDS_DIR = os.path.join(DATA_DIR, "feeds")
 CACHE_PATH = os.path.join(DATA_DIR, "lw_cache.json")
@@ -215,18 +231,66 @@ def report_job():
     gc.collect()
 
 
+def weekly_job():
+    """生成新药获批周报。失败只记日志，不影响其他任务。"""
+    if wkl is None:
+        print(f"[{now()}] 周报模块未加载，跳过", flush=True)
+        return
+    if not os.environ.get("LLM_API_KEY"):
+        print(f"[{now()}] 未设置 LLM_API_KEY，跳过周报", flush=True)
+        return
+    print(f"[{now()}] 开始生成周报", flush=True)
+    try:
+        wkl.generate(
+            cache_path=CACHE_PATH,
+            out_dir=FEEDS_DIR,
+            reports_dir=REPORTS_DIR,
+            base_url=os.environ.get("LW_BASE_URL", ""),
+            window_hours=int(os.environ.get("LW_WEEKLY_WINDOW_HOURS", "168")),
+            max_articles=int(os.environ.get("LW_WEEKLY_MAX_ARTICLES", "40")),
+            max_chars=int(os.environ.get("LW_WEEKLY_MAX_CHARS", "3000")),
+            screen_batch=int(os.environ.get("LW_WEEKLY_SCREEN_BATCH", "20")),
+            screen_max_tokens=int(os.environ.get("LW_WEEKLY_SCREEN_MAX_TOKENS", "6000")),
+            extract_batch=int(os.environ.get("LW_WEEKLY_EXTRACT_BATCH", "2")),
+            extract_max_tokens=int(os.environ.get("LW_WEEKLY_EXTRACT_MAX_TOKENS", "5000")),
+            weekly_slug=os.environ.get("LW_WEEKLY_SLUG", "weekly-approvals"),
+            push=os.environ.get("LW_WEEKLY_PUSH", "1") != "0",
+        )
+        print(f"[{now()}] 周报完成", flush=True)
+    except SystemExit as e:
+        print(f"[{now()}] 周报因配置问题中止: {e}", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[{now()}] 周报异常: {e}", flush=True)
+    gc.collect()
+
+
 def next_event(t):
-    """把抓取和日报两套时刻表合成一条时间线，同一时刻两件事都做。"""
+    """把抓取、日报、周报三套时刻表合成一条时间线，同一时刻的事情一起做。"""
     best, kinds = None, set()
+
+    def consider(c, kind):
+        nonlocal best, kinds
+        if best is None or c < best:
+            best, kinds = c, {kind}
+        elif c == best:
+            kinds.add(kind)
+
     for times, kind in ((RUN_HOURS, "fetch"), (REPORT_HOURS, "report")):
         for h, m in times:
             c = t.replace(hour=h, minute=m, second=0, microsecond=0)
             if c <= t:
                 c += timedelta(days=1)
-            if best is None or c < best:
-                best, kinds = c, {kind}
-            elif c == best:
-                kinds.add(kind)
+            consider(c, kind)
+
+    # 周报只在指定星期几触发，所以要先算出"下一个该星期几"再对齐时刻
+    for h, m in WEEKLY_HOURS:
+        c = t.replace(hour=h, minute=m, second=0, microsecond=0)
+        delta = (WEEKLY_DAY - c.weekday()) % 7
+        c += timedelta(days=delta)
+        if c <= t:
+            c += timedelta(days=7)
+        consider(c, "weekly")
+
     return best, kinds
 
 
@@ -251,6 +315,8 @@ def scheduler():
             run_job()
         if "report" in kinds:
             report_job()
+        if "weekly" in kinds:
+            weekly_job()
 
 
 if __name__ == "__main__":
