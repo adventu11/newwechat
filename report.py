@@ -369,8 +369,14 @@ def render_audit(date_str, audit, cands_total):
 # ---------------------------------------------------------------- 阶段二 精读
 
 
-def digest(items, role_prompt, batch_size=4):
-    """对通过粗筛的文章做要点提炼，返回 {entry_id: {summary, points}}。"""
+def digest(items, role_prompt, batch_size=4, max_tokens=5000):
+    """对通过粗筛的文章做要点提炼，返回 {entry_id: {summary, points}}。
+
+    max_tokens 同 screen()：批越大、原文越长，需要的输出预算越高，
+    预算不够会导致整批解析失败——失败不丢文章(自动降级成用摘要)，
+    但会丢失这批的要点提炼，报告质量打折。批量失败率明显偏高时，
+    优先调小 batch_size，其次再考虑加大这个预算。
+    """
     out = {}
     sys_msg = (
         role_prompt
@@ -400,7 +406,7 @@ def digest(items, role_prompt, batch_size=4):
                     {"role": "system", "content": sys_msg},
                     {"role": "user", "content": "\n\n".join(blocks)},
                 ],
-                max_tokens=3000,
+                max_tokens=max_tokens,
             )
             arr = parse_json_loose(res)
         except Exception as e:  # noqa: BLE001
@@ -511,7 +517,8 @@ def generate(
     max_chars=3000,
     screen_batch=20,
     screen_max_tokens=6000,
-    digest_batch=4,
+    digest_batch=3,
+    digest_max_tokens=5000,
     report_slug="daily-report",
     report_keep=30,
     push=True,
@@ -571,7 +578,7 @@ def generate(
     for it in kept:
         it["_text"] = get_article_text(headers, it, max_chars)
 
-    digests = digest(kept, role_prompt, batch_size=digest_batch)
+    digests = digest(kept, role_prompt, batch_size=digest_batch, max_tokens=digest_max_tokens)
 
     for it in kept:
         meta = picked[it["entry_id"]]
@@ -675,7 +682,15 @@ def main():
         default=6000,
         help="粗筛每批的输出预算(tokens)。带推理过程的模型需要更大预算",
     )
-    ap.add_argument("--digest-batch", type=int, default=4, help="精读每批文章数")
+    ap.add_argument(
+        "--digest-batch",
+        type=int,
+        default=3,
+        help="精读每批文章数。同样批越大越容易被截断解析失败",
+    )
+    ap.add_argument(
+        "--digest-max-tokens", type=int, default=5000, help="精读每批的输出预算(tokens)"
+    )
     ap.add_argument("--report-slug", default="daily-report")
     ap.add_argument("--no-push", dest="push", action="store_false", help="不推微信")
     ap.add_argument("--dry-run", action="store_true", help="只打印，不落盘不推送")
@@ -694,6 +709,7 @@ def main():
         screen_batch=args.screen_batch,
         screen_max_tokens=args.screen_max_tokens,
         digest_batch=args.digest_batch,
+        digest_max_tokens=args.digest_max_tokens,
         report_slug=args.report_slug,
         push=args.push,
         dry_run=args.dry_run,

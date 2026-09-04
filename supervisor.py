@@ -202,7 +202,8 @@ def report_job():
             max_chars=int(os.environ.get("LW_REPORT_MAX_CHARS", "3000")),
             screen_batch=int(os.environ.get("LW_REPORT_SCREEN_BATCH", "20")),
             screen_max_tokens=int(os.environ.get("LW_REPORT_SCREEN_MAX_TOKENS", "6000")),
-            digest_batch=int(os.environ.get("LW_REPORT_DIGEST_BATCH", "4")),
+            digest_batch=int(os.environ.get("LW_REPORT_DIGEST_BATCH", "3")),
+            digest_max_tokens=int(os.environ.get("LW_REPORT_DIGEST_MAX_TOKENS", "5000")),
             report_slug=os.environ.get("LW_REPORT_SLUG", "daily-report"),
             push=os.environ.get("LW_REPORT_PUSH", "1") != "0",
         )
