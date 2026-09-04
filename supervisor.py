@@ -28,6 +28,7 @@ import time
 from datetime import datetime, timedelta
 
 import lingowhale2rss as lw2r
+import report as rpt
 
 try:
     from zoneinfo import ZoneInfo
@@ -38,9 +39,14 @@ except Exception:  # noqa: BLE001
     print("[!] zoneinfo 不可用，退回本地时区，请确认容器 TZ 设置正确", flush=True)
 
 RUN_HOURS = [int(h) for h in os.environ.get("LW_RUN_HOURS", "7,10,13,16,19,22").split(",")]
+# 日报时间点。留空则不生成日报。默认 8 点——排在 7 点抓取之后，隔一小时够跑完
+REPORT_HOURS = [
+    int(h) for h in os.environ.get("LW_REPORT_HOURS", "8").split(",") if h.strip()
+]
 DATA_DIR = os.environ.get("LW_DATA_DIR", "/app/data")
 FEEDS_DIR = os.path.join(DATA_DIR, "feeds")
 CACHE_PATH = os.path.join(DATA_DIR, "lw_cache.json")
+REPORTS_DIR = os.path.join(DATA_DIR, "reports")
 PORT = int(os.environ.get("PORT", 8080))
 
 
@@ -101,16 +107,6 @@ def serve():
         httpd.serve_forever()
 
 
-def next_run(t):
-    candidates = []
-    for h in RUN_HOURS:
-        c = t.replace(hour=h, minute=0, second=0, microsecond=0)
-        if c <= t:
-            c += timedelta(days=1)
-        candidates.append(c)
-    return min(candidates)
-
-
 def run_job():
     print(f"[{now()}] 开始抓取", flush=True)
     if os.environ.get("LW_MAX_ITEMS"):
@@ -152,16 +148,68 @@ def run_job():
     gc.collect()
 
 
+def report_job():
+    """生成 AI 日报。失败只记日志，绝不能影响抓取和 HTTP 服务。"""
+    if not os.environ.get("LLM_API_KEY"):
+        print(f"[{now()}] 未设置 LLM_API_KEY，跳过日报", flush=True)
+        return
+    print(f"[{now()}] 开始生成日报", flush=True)
+    try:
+        rpt.generate(
+            cache_path=CACHE_PATH,
+            out_dir=FEEDS_DIR,
+            reports_dir=REPORTS_DIR,
+            base_url=os.environ.get("LW_BASE_URL", ""),
+            window_hours=int(os.environ.get("LW_REPORT_WINDOW_HOURS", "26")),
+            max_articles=int(os.environ.get("LW_REPORT_MAX_ARTICLES", "25")),
+            max_chars=int(os.environ.get("LW_REPORT_MAX_CHARS", "3000")),
+            report_slug=os.environ.get("LW_REPORT_SLUG", "daily-report"),
+            push=os.environ.get("LW_REPORT_PUSH", "1") != "0",
+        )
+        print(f"[{now()}] 日报完成", flush=True)
+    except SystemExit as e:
+        print(f"[{now()}] 日报因配置问题中止: {e}", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[{now()}] 日报异常: {e}", flush=True)
+    gc.collect()
+
+
+def next_event(t):
+    """把抓取和日报两套时刻表合成一条时间线，同一时刻两件事都做。"""
+    best, kinds = None, set()
+    for hours, kind in ((RUN_HOURS, "fetch"), (REPORT_HOURS, "report")):
+        for h in hours:
+            c = t.replace(hour=h, minute=0, second=0, microsecond=0)
+            if c <= t:
+                c += timedelta(days=1)
+            if best is None or c < best:
+                best, kinds = c, {kind}
+            elif c == best:
+                kinds.add(kind)
+    return best, kinds
+
+
 def scheduler():
-    # 启动时先跑一次，避免部署后要空等到下一个整点才有数据
+    # 启动时先抓一次，避免部署后要空等到下一个整点才有数据。
+    # 日报不在启动时跑——容器重启一次就推一条微信太吵，
+    # 想手动补一份用 LW_REPORT_ON_START=1。
     run_job()
+    if os.environ.get("LW_REPORT_ON_START") == "1":
+        report_job()
+
     while True:
         t = now()
-        nxt = next_run(t)
+        nxt, kinds = next_event(t)
         wait = (nxt - t).total_seconds()
-        print(f"下次抓取: {nxt} (等待 {wait / 3600:.1f} 小时)", flush=True)
+        print(
+            f"下次任务: {nxt} [{'+'.join(sorted(kinds))}] (等待 {wait / 3600:.1f} 小时)",
+            flush=True,
+        )
         time.sleep(max(wait, 1))
-        run_job()
+        if "fetch" in kinds:
+            run_job()
+        if "report" in kinds:
+            report_job()
 
 
 if __name__ == "__main__":
