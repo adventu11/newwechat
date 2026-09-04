@@ -200,6 +200,9 @@ def report_job():
             window_hours=int(os.environ.get("LW_REPORT_WINDOW_HOURS", "26")),
             max_articles=int(os.environ.get("LW_REPORT_MAX_ARTICLES", "25")),
             max_chars=int(os.environ.get("LW_REPORT_MAX_CHARS", "3000")),
+            screen_batch=int(os.environ.get("LW_REPORT_SCREEN_BATCH", "20")),
+            screen_max_tokens=int(os.environ.get("LW_REPORT_SCREEN_MAX_TOKENS", "6000")),
+            digest_batch=int(os.environ.get("LW_REPORT_DIGEST_BATCH", "4")),
             report_slug=os.environ.get("LW_REPORT_SLUG", "daily-report"),
             push=os.environ.get("LW_REPORT_PUSH", "1") != "0",
         )

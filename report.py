@@ -12,10 +12,11 @@ report.py —— 在 lingowhale2rss 抓到的文章上加一层 AI 筛选/摘要
               全文按 REPORT_MAX_CHARS 截断，避免长文顶爆上下文。
 最后由 Python 按分类拼装报告——排版是确定性的，不让模型自由发挥版式。
 
-产出三份:
-  data/reports/YYYY-MM-DD.md      归档
-  data/feeds/<REPORT_SLUG>.atom   Miniflux 订阅(保留最近 REPORT_KEEP 期)
-  Server酱微信推送                 配了 SERVERCHAN_SENDKEY 才推
+产出四份:
+  data/reports/YYYY-MM-DD.md         归档
+  data/reports/YYYY-MM-DD-audit.md   粗筛审计: 135 篇候选逐条 保留/过滤 + 理由
+  data/feeds/<REPORT_SLUG>.atom      Miniflux 订阅(保留最近 REPORT_KEEP 期)
+  Server酱微信推送                    配了 SERVERCHAN_SENDKEY 才推
 
 依赖: 只用标准库 + 一个 OpenAI 兼容的 chat/completions 接口。
       DeepSeek / 智谱 / 通义 / Kimi / OpenAI 都能直接用，改 LLM_BASE_URL 即可。
@@ -211,8 +212,18 @@ def get_article_text(headers, item, limit):
 # ---------------------------------------------------------------- 阶段一 粗筛
 
 
-def screen(items, role_prompt, batch_size=40):
-    """输入候选文章，返回 {entry_id: {category, priority, reason}}，未通过的不出现。"""
+def screen(items, role_prompt, batch_size=40, audit=None, max_tokens=6000):
+    """
+    输入候选文章，返回 {entry_id: {category, priority, reason}}，未通过的不出现。
+
+    audit: 传入一个 list，会原样记下每一条的完整判定(含 keep=false 和理由)，
+    用于事后回看"AI 到底看没看到这篇、为什么筛掉"。不传就不记录，行为不变。
+
+    max_tokens 是每批判定的输出预算。有些模型(尤其带"思考"过程的)会先输出
+    大段推理文字再给 JSON，batch_size 越大、需要的预算越高——预算不够时输出
+    在 JSON 写完前被截断，导致整批解析失败。批太大反而更容易全批失败，
+    宁可把 batch_size 调小一点，也别一味加大 max_tokens。
+    """
     kept = {}
     sys_msg = (
         role_prompt
@@ -222,7 +233,7 @@ def screen(items, role_prompt, batch_size=40):
         + '"category": "' + "|".join(CATEGORIES) + '", '
         + '"priority": 1-3, "reason": "12字以内理由"}'
         + "\npriority: 1=必须今天看 2=值得看 3=有空再看。"
-        + "\n宁缺毋滥：拿不准的、信息量不足的，一律 keep=false。"
+        + "\n宁缺毋滥：拿不准的、信息量不足的，一律 keep=false，并在 reason 里说明原因。"
     )
 
     for start in range(0, len(items), batch_size):
@@ -240,34 +251,78 @@ def screen(items, role_prompt, batch_size=40):
                     {"role": "system", "content": sys_msg},
                     {"role": "user", "content": "\n".join(lines)},
                 ],
-                max_tokens=4000,
+                max_tokens=max_tokens,
             )
             arr = parse_json_loose(out)
         except Exception as e:  # noqa: BLE001
             # 粗筛失败就跳过这一批，而不是把整批当成通过——
             # 宁可这批今天不进报告，也不要放一堆无关内容进去。
             print(f"  [!] 粗筛失败(第 {start // batch_size + 1} 批): {e}", file=sys.stderr)
+            if audit is not None:
+                for it in chunk:
+                    audit.append(
+                        {
+                            "entry_id": it["entry_id"],
+                            "title": it.get("title") or "",
+                            "channel": it.get("channel") or "",
+                            "keep": None,  # None = 这批模型调用失败，没判到
+                            "category": "",
+                            "reason": "本批粗筛调用失败",
+                        }
+                    )
             continue
 
+        by_idx = {}
         for r in arr if isinstance(arr, list) else []:
             try:
                 idx = int(r.get("i"))
             except (TypeError, ValueError):
                 continue
-            if not r.get("keep") or not (0 <= idx < len(chunk)):
+            if 0 <= idx < len(chunk):
+                by_idx[idx] = r
+
+        for i, it in enumerate(chunk):
+            r = by_idx.get(i)
+            if r is None:
+                if audit is not None:
+                    audit.append(
+                        {
+                            "entry_id": it["entry_id"],
+                            "title": it.get("title") or "",
+                            "channel": it.get("channel") or "",
+                            "keep": None,  # 模型这批返回里漏判了这一条
+                            "category": "",
+                            "reason": "模型未返回判定",
+                        }
+                    )
                 continue
+
             cat = r.get("category")
             if cat not in CATEGORIES:
                 cat = "行业资讯"
+            reason = (r.get("reason") or "")[:40]
+            keep = bool(r.get("keep"))
+
+            if audit is not None:
+                audit.append(
+                    {
+                        "entry_id": it["entry_id"],
+                        "title": it.get("title") or "",
+                        "channel": it.get("channel") or "",
+                        "keep": keep,
+                        "category": cat,
+                        "reason": reason,
+                    }
+                )
+            if not keep:
+                continue
+
             try:
                 pri = max(1, min(3, int(r.get("priority", 2))))
             except (TypeError, ValueError):
                 pri = 2
-            kept[chunk[idx]["entry_id"]] = {
-                "category": cat,
-                "priority": pri,
-                "reason": (r.get("reason") or "")[:40],
-            }
+            kept[it["entry_id"]] = {"category": cat, "priority": pri, "reason": reason}
+
         print(
             f"  粗筛 {start + 1}-{start + len(chunk)}: 通过 "
             f"{sum(1 for it in chunk if it['entry_id'] in kept)} 条",
@@ -275,6 +330,40 @@ def screen(items, role_prompt, batch_size=40):
         )
         time.sleep(1)
     return kept
+
+
+def render_audit(date_str, audit, cands_total):
+    """把粗筛全过程渲染成人可读的 markdown：每一篇 保留/过滤 + 理由。"""
+    kept_n = sum(1 for a in audit if a["keep"] is True)
+    dropped_n = sum(1 for a in audit if a["keep"] is False)
+    unjudged_n = sum(1 for a in audit if a["keep"] is None)
+
+    out = [
+        f"# 粗筛审计 {date_str}",
+        "",
+        f"候选 {cands_total} 篇，模型判定 {len(audit)} 篇 "
+        f"（保留 {kept_n} / 过滤 {dropped_n} / 未判定 {unjudged_n}）。",
+        "",
+        "## 保留",
+        "",
+    ]
+    for a in audit:
+        if a["keep"] is True:
+            out.append(f"- ✅ 【{a['channel']}】{a['title']} — {a['category']} — {a['reason']}")
+    out.append("")
+    out.append("## 过滤")
+    out.append("")
+    for a in audit:
+        if a["keep"] is False:
+            out.append(f"- ❌ 【{a['channel']}】{a['title']} — {a['reason']}")
+    if unjudged_n:
+        out.append("")
+        out.append("## 未判定(模型批次调用失败或漏判，未计入报告，也未计入过滤)")
+        out.append("")
+        for a in audit:
+            if a["keep"] is None:
+                out.append(f"- ⚠️ 【{a['channel']}】{a['title']} — {a['reason']}")
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------- 阶段二 精读
@@ -420,7 +509,8 @@ def generate(
     window_hours=26,
     max_articles=25,
     max_chars=3000,
-    screen_batch=40,
+    screen_batch=20,
+    screen_max_tokens=6000,
     digest_batch=4,
     report_slug="daily-report",
     report_keep=30,
@@ -459,7 +549,11 @@ def generate(
     if not cands:
         return None
 
-    picked = screen(cands, role_prompt, batch_size=screen_batch)
+    picked = {}
+    audit = []
+    picked = screen(
+        cands, role_prompt, batch_size=screen_batch, audit=audit, max_tokens=screen_max_tokens
+    )
     kept = [it for it in cands if it["entry_id"] in picked]
     kept.sort(key=lambda x: (picked[x["entry_id"]]["priority"], -(x.get("pub_time") or 0)))
     if len(kept) > max_articles:
@@ -496,10 +590,14 @@ def generate(
         print(md)
         return md
 
-    # ---- 归档 markdown
+    # ---- 归档 markdown + 粗筛审计(每篇 保留/过滤 + 理由，回答"AI 到底看了哪些")
     os.makedirs(reports_dir, exist_ok=True)
     with open(os.path.join(reports_dir, f"{date_str}.md"), "w", encoding="utf-8") as f:
         f.write(md)
+    audit_path = os.path.join(reports_dir, f"{date_str}-audit.md")
+    with open(audit_path, "w", encoding="utf-8") as f:
+        f.write(render_audit(date_str, audit, len(cands)))
+    print(f"[报告] 粗筛审计已写入 {audit_path}", file=sys.stderr)
 
     # ---- 写成 Atom，Miniflux 里当成一个"日报"订阅源
     hist_path = os.path.join(data_dir, "lw_report_history.json")
@@ -531,10 +629,18 @@ def generate(
     with open(os.path.join(out_dir, f"{report_slug}.atom"), "w", encoding="utf-8") as f:
         f.write(xml)
 
-    # ---- 记账：报过的文章不再进下一天的候选
+    # ---- 记账：只记"模型真正判过的"（keep 是 True 或 False）
+    # 粗筛某一批调用失败时，那批文章在 audit 里是 keep=None(未判定)，
+    # 绝不能记进 reported——不然它们再也不会被拿去判一次，等于永久漏读。
+    # 等下一轮 window_hours 窗口还覆盖得到，它们会自动重新进入候选。
+    judged_ids = {a["entry_id"] for a in audit if a["keep"] is not None}
+    unjudged = len(cands) - len(judged_ids)
+    if unjudged:
+        print(f"[报告] {unjudged} 篇因粗筛调用失败未被判定，将在下一轮重试", file=sys.stderr)
     ts = int(time.time())
-    for it in cands:  # 粗筛过的全部记账，被筛掉的也不用再判一次，省钱
-        reported[it["entry_id"]] = ts
+    for it in cands:
+        if it["entry_id"] in judged_ids:
+            reported[it["entry_id"]] = ts
     cutoff = ts - 30 * 86400
     state["reported"] = {k: v for k, v in reported.items() if v >= cutoff}
     lw2r.save_json(state_path, state)
@@ -556,6 +662,20 @@ def main():
     ap.add_argument("--window-hours", type=int, default=26)
     ap.add_argument("--max-articles", type=int, default=25)
     ap.add_argument("--max-chars", type=int, default=3000, help="每篇正文喂给模型的上限")
+    ap.add_argument(
+        "--screen-batch",
+        type=int,
+        default=20,
+        help="粗筛每批文章数。批越大越容易被模型输出长度截断导致整批解析失败，"
+        "遇到'无法解析模型返回的JSON'报错就调小这个值",
+    )
+    ap.add_argument(
+        "--screen-max-tokens",
+        type=int,
+        default=6000,
+        help="粗筛每批的输出预算(tokens)。带推理过程的模型需要更大预算",
+    )
+    ap.add_argument("--digest-batch", type=int, default=4, help="精读每批文章数")
     ap.add_argument("--report-slug", default="daily-report")
     ap.add_argument("--no-push", dest="push", action="store_false", help="不推微信")
     ap.add_argument("--dry-run", action="store_true", help="只打印，不落盘不推送")
@@ -571,6 +691,9 @@ def main():
         window_hours=args.window_hours,
         max_articles=args.max_articles,
         max_chars=args.max_chars,
+        screen_batch=args.screen_batch,
+        screen_max_tokens=args.screen_max_tokens,
+        digest_batch=args.digest_batch,
         report_slug=args.report_slug,
         push=args.push,
         dry_run=args.dry_run,
