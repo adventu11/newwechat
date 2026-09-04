@@ -46,11 +46,37 @@ except Exception:  # noqa: BLE001
     TZ = None
     print("[!] zoneinfo 不可用，退回本地时区，请确认容器 TZ 设置正确", flush=True)
 
-RUN_HOURS = [int(h) for h in os.environ.get("LW_RUN_HOURS", "7,10,13,16,19,22").split(",")]
+def parse_times(spec, default):
+    """
+    解析 "7,10,13:30,19" 这样的时间点列表，返回 [(hour, minute), ...]。
+
+    支持纯小时("7")和"时:分"("7:50")两种写法混用。任何一项解析失败都整体
+    退回 default，而不是让异常冒到模块顶层——这里一崩，容器就进重启循环
+    （之前 LW_RUN_HOURS 就出过这个问题），一个环境变量填错不该有这个权力。
+    """
+    try:
+        out = []
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" in part:
+                h, m = part.split(":", 1)
+                h, m = int(h), int(m)
+            else:
+                h, m = int(part), 0
+            if not (0 <= h <= 23 and 0 <= m <= 59):
+                raise ValueError(f"超出范围: {part}")
+            out.append((h, m))
+        return out
+    except Exception as e:  # noqa: BLE001
+        print(f"[!] 时间点解析失败 {spec!r}({e})，退回默认值 {default!r}", flush=True)
+        return parse_times(default, default) if spec != default else []
+
+
+RUN_HOURS = parse_times(os.environ.get("LW_RUN_HOURS", "7,10,13,16,19,22"), "7,10,13,16,19,22")
 # 日报时间点。留空则不生成日报。默认 8 点——排在 7 点抓取之后，隔一小时够跑完
-REPORT_HOURS = [
-    int(h) for h in os.environ.get("LW_REPORT_HOURS", "8").split(",") if h.strip()
-]
+REPORT_HOURS = parse_times(os.environ.get("LW_REPORT_HOURS", "8"), "8")
 DATA_DIR = os.environ.get("LW_DATA_DIR", "/app/data")
 FEEDS_DIR = os.path.join(DATA_DIR, "feeds")
 CACHE_PATH = os.path.join(DATA_DIR, "lw_cache.json")
@@ -188,9 +214,9 @@ def report_job():
 def next_event(t):
     """把抓取和日报两套时刻表合成一条时间线，同一时刻两件事都做。"""
     best, kinds = None, set()
-    for hours, kind in ((RUN_HOURS, "fetch"), (REPORT_HOURS, "report")):
-        for h in hours:
-            c = t.replace(hour=h, minute=0, second=0, microsecond=0)
+    for times, kind in ((RUN_HOURS, "fetch"), (REPORT_HOURS, "report")):
+        for h, m in times:
+            c = t.replace(hour=h, minute=m, second=0, microsecond=0)
             if c <= t:
                 c += timedelta(days=1)
             if best is None or c < best:
