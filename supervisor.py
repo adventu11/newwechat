@@ -28,7 +28,15 @@ import time
 from datetime import datetime, timedelta
 
 import lingowhale2rss as lw2r
-import report as rpt
+
+# 日报模块是可选的。缺文件、或者 report.py 自身有语法错误时，
+# 这里必须降级而不是抛异常——supervisor 挂掉会连 HTTP 服务和抓取一起带走，
+# Miniflux 那边直接断粮，代价远大于"今天没有日报"。
+try:
+    import report as rpt
+except Exception as _e:  # noqa: BLE001
+    rpt = None
+    print(f"[!] 日报模块不可用({_e})，本次仅抓取，不生成日报", flush=True)
 
 try:
     from zoneinfo import ZoneInfo
@@ -150,6 +158,9 @@ def run_job():
 
 def report_job():
     """生成 AI 日报。失败只记日志，绝不能影响抓取和 HTTP 服务。"""
+    if rpt is None:
+        print(f"[{now()}] 日报模块未加载，跳过", flush=True)
+        return
     if not os.environ.get("LLM_API_KEY"):
         print(f"[{now()}] 未设置 LLM_API_KEY，跳过日报", flush=True)
         return
